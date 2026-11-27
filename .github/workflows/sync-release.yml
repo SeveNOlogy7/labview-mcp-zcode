@@ -1,9 +1,13 @@
 name: sync-release
 
-# Rebuilds the generated branch (main) from the latest official labview-mcp release:
-# download -> sha256 verify against the release's own checksum asset -> extract ->
-# add the marketplace/ZCode manifests -> force-replace main with a single commit.
-# The tree stays a one-release snapshot; history is intentionally disposable.
+# Rebuilds the generated branch (main) from the latest official labview-mcp release.
+#
+# ZCode refuses any single archive entry above 50 MB, and the official exe is ~85 MB, so
+# the exe ships as two <50 MB parts that bin/launch.cmd reassembles on first run
+# (byte-identical: copy /b part00 + part01 == official exe). The MCP command in
+# .mcp.json / .zcode-plugin/plugin.json goes through PowerShell + Join-Path with
+# $env:CLAUDE_PLUGIN_ROOT and no backslashes or brace placeholders, because ZCode's
+# install step normalizes path-like strings once and mangles backslash escapes.
 
 on:
   schedule:
@@ -67,16 +71,48 @@ jobs:
           mkdir -p "$tree"
           unzip -q "$RUNNER_TEMP/rel/labview-mcp.zip" -d "$tree"
 
-          # Generated manifests: listing (both discovery locations) + ZCode manifest.
+          # 50 MB archive-entry ceiling: ship the exe as two parts, reassembled by launch.cmd.
+          exe_size=$(stat -c %s "$tree/bin/LabVIEWMCP.exe")
+          split -b 44000000 -d "$tree/bin/LabVIEWMCP.exe" "$tree/bin/LabVIEWMCP.exe.part"
+          rm "$tree/bin/LabVIEWMCP.exe"
+          sum=0
+          for p in "$tree"/bin/LabVIEWMCP.exe.part*; do sum=$((sum + $(stat -c %s "$p"))); done
+          test "$sum" -eq "$exe_size" || { echo "::error::parts do not add up to the exe size"; exit 1; }
+
+          cat > "$tree/bin/launch.cmd" <<'LAUNCH'
+@echo off
+rem Reassembles LabVIEWMCP.exe from its two parts on first run (ZCode refuses any
+rem single archive entry above 50 MB, and the official exe is ~85 MB), then execs it.
+setlocal
+set "BIN=%~dp0"
+set "EXE=%BIN%LabVIEWMCP.exe"
+if not exist "%EXE%" (
+  copy /b "%BIN%LabVIEWMCP.exe.part00"+"%BIN%LabVIEWMCP.exe.part01" "%EXE%" >nul
+  if errorlevel 1 (
+    echo launch.cmd: failed to reassemble LabVIEWMCP.exe 1>&2
+    exit /b 1
+  )
+)
+"%EXE%" %*
+LAUNCH
+
+          # Generated manifests. No backslashes and no ${...} placeholders on purpose:
+          # ZCode normalizes such strings once at install time and breaks backslash escapes.
           node -e '
             const fs = require("fs");
             const d = process.env.RUNNER_TEMP + "/tree";
             const pj = JSON.parse(fs.readFileSync(d + "/.claude-plugin/plugin.json", "utf8"));
-            const mcp = JSON.parse(fs.readFileSync(d + "/.mcp.json", "utf8"));
             const vt = fs.readFileSync(d + "/VERSION.txt", "utf8");
-            const tag = vt.match(/^tag:\s*(\S+)/m)[1];
+            const tag = vt.match(/^tag:\s*(\S+)/)[1];
             const version = tag.replace(/^v/, "");
             if (pj.version !== version) throw new Error(`version mismatch: ${pj.version} vs ${version}`);
+            const mcp = { mcpServers: { labview: {
+              command: "powershell",
+              args: ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+                     "& cmd /c (Join-Path $env:CLAUDE_PLUGIN_ROOT \x27bin/launch.cmd\x27)"],
+              env: {},
+            } } };
+            fs.writeFileSync(d + "/.mcp.json", JSON.stringify(mcp, null, 2) + "\n");
             const zc = {
               name: pj.name, displayName: pj.displayName || "LabVIEW MCP", version,
               description: pj.description, author: pj.author, homepage: pj.homepage,
@@ -106,7 +142,7 @@ jobs:
             fs.writeFileSync(d + "/.claude-plugin/marketplace.json", text);
           '
 
-          # Static files that must survive the rewrite.
+          # Static files carried across the rewrite.
           cp README.md "$tree/"
           mkdir -p "$tree/.github/workflows"
           cp .github/workflows/sync-release.yml "$tree/.github/workflows/"
@@ -118,15 +154,15 @@ jobs:
           git add -A --force
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -m "release: ${TAG} (official release tree, sha256-verified; built-dist visible in VERSION.txt of the release)"
+          git commit -m "release: ${TAG} (official release tree, sha256-verified, exe split for ZCode 50 MB entry ceiling)"
 
-          # Assertions: the tree must carry the exe and every manifest.
-          row=$(git ls-tree -r --long HEAD | awk '$NF=="bin/LabVIEWMCP.exe"{print $(NF-1)}')
-          test -n "$row" || { echo "::error::bin/LabVIEWMCP.exe missing from the commit"; exit 1; }
-          test "$row" = "$(stat -c %s bin/LabVIEWMCP.exe)" || { echo "::error::exe size mismatch"; exit 1; }
-          for f in marketplace.json .claude-plugin/marketplace.json .claude-plugin/plugin.json .zcode-plugin/plugin.json .mcp.json VERSION.txt; do
+          # Assertions.
+          bad=$(find . -path ./.git -prune -o -type f -size +52428799c -print | head -1)
+          test -z "$bad" || { echo "::error::file above the 50 MiB ceiling: $bad"; exit 1; }
+          for f in marketplace.json .claude-plugin/marketplace.json .claude-plugin/plugin.json .zcode-plugin/plugin.json .mcp.json VERSION.txt bin/launch.cmd bin/LabVIEWMCP.exe.part00 bin/LabVIEWMCP.exe.part01; do
             git ls-tree -r HEAD | grep -q "	$f$" || { echo "::error::missing $f"; exit 1; }
           done
+          ! git ls-tree -r HEAD | grep -q "	bin/LabVIEWMCP.exe$" || { echo "::error::unsplit exe present"; exit 1; }
 
           git push --force origin HEAD:main
           echo "main rebuilt at $(git rev-parse --short HEAD) for ${TAG}"

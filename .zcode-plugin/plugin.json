@@ -1,21 +1,23 @@
 {
-    "name":  "labview-mcp",
-    "displayName":  "LabVIEW MCP",
-    "version":  "3.1.6",
-    "description":  "Read, write and run LabVIEW 2026 code from an AI assistant - VIs as text via AIXML, classes and interfaces through NI\u0027s own project providers, palette and shipping-example search, Caraya unit tests, DQMH modules and events driven through Delacor\u0027s own scripting, and eight bundled LabVIEW agents. Windows x64 only.",
-    "author":  {
-                   "name":  "Zühlke Engineering AG"
-               },
-    "homepage":  "https://github.com/Zuehlke/labview-mcp",
-    "mcpServers":  {
-                       "labview":  {
-                                       "command":  "${CLAUDE_PLUGIN_ROOT}/bin/LabVIEWMCP.exe",
-                                       "args":  [
-
-                                                ],
-                                       "env":  {
-
-                                               }
-                                   }
-                   }
+  "name": "labview-mcp",
+  "displayName": "LabVIEW MCP",
+  "version": "3.1.6",
+  "description": "Read, write and run LabVIEW 2026 code from an AI assistant - VIs as text via AIXML, classes and interfaces through NI's own project providers, palette and shipping-example search, Caraya unit tests, DQMH modules and events driven through Delacor's own scripting, and eight bundled LabVIEW agents. Windows x64 only.",
+  "author": {
+    "name": "Zühlke Engineering AG"
+  },
+  "homepage": "https://github.com/Zuehlke/labview-mcp",
+  "mcpServers": {
+    "labview": {
+      "command": "powershell",
+      "args": [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        "& cmd /c (Join-Path $env:CLAUDE_PLUGIN_ROOT 'bin/launch.cmd')"
+      ],
+      "env": {}
+    }
+  }
 }

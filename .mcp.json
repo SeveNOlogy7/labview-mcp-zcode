@@ -1,8 +1,14 @@
 {
   "mcpServers": {
     "labview": {
-      "command": "${CLAUDE_PLUGIN_ROOT}/bin/LabVIEWMCP.exe",
-      "args": [],
+      "command": "powershell",
+      "args": [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        "& cmd /c (Join-Path $env:CLAUDE_PLUGIN_ROOT 'bin/launch.cmd')"
+      ],
       "env": {}
     }
   }
