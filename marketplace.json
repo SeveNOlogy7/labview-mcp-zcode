@@ -1,0 +1,32 @@
+{
+    "name":  "zuehlke-labview-zcode",
+    "owner":  {
+                  "name":  "SeveNOlogy7"
+              },
+    "description":  "Community ZCode marketplace for the official LabVIEW MCP release. Unofficial - not affiliated with or endorsed by Zuhlke. The plugin zip is fetched directly from the official Zuehlke/labview-mcp GitHub releases (pin: v3.1.6, sha256-verified); this repository only carries the marketplace listing.",
+    "plugins":  [
+                    {
+                        "name":  "labview-mcp",
+                        "source":  "./",
+                        "version":  "3.1.6",
+                        "description":  "Read, write and run LabVIEW 2026 code from an AI assistant - VIs as text via AIXML, palette and shipping-example search, Caraya unit tests, DQMH modules and events, and eight bundled LabVIEW agents. Windows x64 only. The zip is fetched from the official Zuehlke/labview-mcp releases.",
+                        "author":  {
+                                       "name":  "Zuhlke Engineering AG (upstream); marketplace maintained by SeveNOlogy7"
+                                   },
+                        "owner":  {
+                                      "name":  "SeveNOlogy7"
+                                  },
+                        "homepage":  "https://github.com/Zuehlke/labview-mcp",
+                        "repository":  "https://github.com/Zuehlke/labview-mcp",
+                        "license":  "MIT",
+                        "keywords":  [
+                                         "labview",
+                                         "mcp",
+                                         "aixml",
+                                         "ni",
+                                         "zcode"
+                                     ],
+                        "category":  "developer-tools"
+                    }
+                ]
+}

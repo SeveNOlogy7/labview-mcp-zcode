@@ -1,0 +1,4917 @@
+# -*- coding: utf-8 -*-
+"""VI -> AIXML with NO LabVIEW and NO NI gRPC service: read the heap through pylabview.
+
+    vi2aixml.py <in.vi | bundle main.xml> [out.xml]
+
+The reverse of aixml2vi.py, and the same knowledge: primitive names from primitive-names.tsv,
+terminal names from terminal-names.tsv, types from VCTP, wiring from the heap's `signal`s.
+uids are the heap's own, which are also the uids LabVIEW's own AIXML export uses for the same
+objects (FINDINGS.md section 3.6) - so an export from here can be diffed against NI's.
+
+What it reads: Control, Indicator (name, type, default value, conIdx, connection),
+Constant (name, type, value), Node for every primitive the name tables know, and the nets
+between them. What it does not read yet is written as an XML comment naming the heap class,
+so nothing is dropped in silence.
+"""
+import copy
+import html
+import json
+import math
+import os
+import re
+import shutil
+import struct
+import sys
+import tempfile
+import xml.etree.ElementTree as ET
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # the bundle's ._pth leaves it off
+import aixml2vi  # noqa: E402
+import linkcache  # noqa: E402
+import lvheap  # noqa: E402
+
+TYPE_TO_AIXML = {v[0]: k for k, v in aixml2vi.SCALARS.items()}
+TYPE_TO_AIXML["MeasureData.TimeStamp"] = "timestamp"
+INT_FMT = aixml2vi.INT_FMT
+SINK = 0x8000          # objFlags bit on a terminal that RECEIVES a wire (measured, see FINDINGS)
+# the second bit a receiving terminal can carry INSTEAD of SINK: every input of the code left of
+# MP3 Parse Frames.vi's loop had 0x4000 and no 0x8000, and the reader dropped its 24 wires as
+# "signal has 2 sources" (2026-11-04). Over 400 NI examples, 33 of the 36 signals with such a
+# terminal have exactly one terminal with neither bit. It decides only when SINK leaves more than
+# one source (wire), never on its own
+SOFT_SINK = 0x4000
+LOOP_STOP_IF_TRUE = aixml2vi.LOOP_STOP_IF_TRUE
+
+
+def escape(s):
+    """AIXML's own escaping for names inside inputs=/outputs=: , and : and \\ as \\XX."""
+    return "".join("\\%02X" % ord(c) if c in ",:\\" else c for c in s)
+
+
+_REF_BY_FLAGS = None
+
+
+def ref_class_name(flags):
+    global _REF_BY_FLAGS
+    if _REF_BY_FLAGS is None:
+        _REF_BY_FLAGS = {}
+        tsv = os.path.join(aixml2vi.OWN_PARTS, "refnum-classes.tsv")
+        for line in open(tsv, encoding="utf-8"):
+            row = line.rstrip("\r\n").split("\t")
+            if line.startswith("#") or row[0] == "class" or len(row) < 2:
+                continue
+            _REF_BY_FLAGS.setdefault(row[1].upper(), row[0])
+    return _REF_BY_FLAGS.get((flags or "").upper())
+
+
+def _sub(tree):
+    """A nested type as NI writes it inside a compound one: the type, then .label if labelled."""
+    t = aixml_type(tree)
+    if t is None:
+        return None
+    lab = tree.get("Label")
+    inner = tree
+    while not lab and inner is not None and inner.get("Type") == "TypeDef":
+        # a typedef'd field carries its label on the type it wraps (an Alignment cluster's
+        # `uint16{Left,Center,Right}.Horizontal`, which NI's export keeps and the wrapper lost)
+        inner = next((c for c in inner if c.tag == "TypeDesc"), None)
+        lab = inner.get("Label") if inner is not None else None
+    return t + ("." + lab.replace(",", "\\2C") if lab else "")
+
+
+def class_names(tree):
+    """The qualified class of every ref{UDClassInst} aixml_type writes for `tree`, in the order
+    it writes them ("3D Plot.lvlib:3D Bar.lvclass"). AIXML names no class - NI's export neither -
+    so the reader hands them to the composer after </VI> (the XControl sweep, 2026-10-22)."""
+    if tree is None:
+        return []
+    t = tree.get("Type")
+    kids = [c for c in tree if c.tag == "TypeDesc"]
+    if t == "Refnum" and tree.get("RefType") == "UDClassInst":
+        return [":".join(i.get("Text") or "" for i in tree.findall("Item"))]
+    if t == "TypeDef":
+        return class_names(kids[0]) if kids else []
+    if t in ("Array", "Cluster") or (t == "Refnum" and tree.get("RefType") in
+                                     ("LVObjCtl", "DataLog", "Notifier", "Queue", "UserEvent", "EventReg", "Occurrence")):
+        return [n for k in kids for n in class_names(k)]
+    return []
+
+
+def xctl_items(tree):
+    """For every VI Server refnum aixml_type writes for `tree` (ref{LV.<Class>}), in its order:
+    the XCONTROL it is typed to - its Item texts joined by ';' (`3DPC_SurfacePlot.xctl;
+    3DPC_SurfacePlot`, HasItem 1, ItmIdent LVXC) - or '' for a plain one. AIXML writes both as
+    ref{LV.Control}; a plain refnum wired into an XControl-typed terminal is a "Class conflict"
+    (Gaussian surface data.vi, 2026-10-22), so the reader hands them on after </VI>."""
+    if tree is None:
+        return []
+    t = tree.get("Type")
+    kids = [c for c in tree if c.tag == "TypeDesc"]
+    if t == "Refnum" and tree.get("RefType") == "LVObjCtl":
+        own = ";".join(i.get("Text") or "" for i in tree.findall("Item")) if tree.get("ItmIdent") == "LVXC" else ""
+        return [own] + [n for k in kids for n in xctl_items(k)]
+    if t in ("TypeDef", "Array", "Cluster", "Function", "Refnum"):
+        return [n for k in kids for n in xctl_items(k)]
+    return []
+
+
+def aixml_type(tree):
+    """The AIXML type literal, as NI's export writes it: scalars, enums uint16{a,b}, a ring the
+    bare integer, array{T.label} / array.2{T}, cluster{T.a,T.b}, timestamp, doublewaveform,
+    variant, ref{LV.<Class>} (a strictly typed control refnum adds {T}), ref{UDClassInst},
+    ref{Visa.Instr}, ref{DataLog}{T}, ref{Notifier}{T}, ref{Queue}{T}. None when unknown."""
+    if tree is None:
+        return None
+    t = tree.get("Type")
+    kids = [c for c in tree if c.tag == "TypeDesc"]
+    if t == "TypeDef":
+        # NI's export FLATTENS a typedef to the type it wraps - the .ctl identity is lost
+        # there (CLAUDE.md, "a placeholder loses every typedef"), so it is lost here too.
+        return aixml_type(kids[0]) if kids else None
+    if t == "Array":
+        dims = len(tree.findall("Dimension"))
+        inner = _sub(kids[0]) if kids else None
+        return None if inner is None else "array%s{%s}" % ("" if dims <= 1 else ".%d" % dims, inner)
+    if t == "Cluster":
+        parts = [_sub(k) for k in kids]
+        return None if any(x is None for x in parts) else "cluster{%s}" % ",".join(parts)
+    if t == "Function":
+        # a connector pane, as NI's export writes Call By Reference's type=: the pattern and each
+        # slot's flags in hex, then the slots' types - function{58,900,...{cluster{..}.error out,..}}
+        parts = ["void" if k.get("Type") == "Void" else _sub(k) for k in kids]
+        if any(x is None for x in parts):
+            return None
+        flags = ["%x" % int(k.get("ref.Flags") or "0", 16) for k in kids]
+        return "function{%s{%s}}" % (",".join(["%x" % int(tree.get("Pattern") or "0", 16)] + flags), ",".join(parts))
+    if t == "MeasureData":
+        # digital data and digital waveforms as NI's export spells them (11 and 2 over its
+        # shipping examples, read `?MeasureData.*` until 2026-11-06)
+        return {"TimeStamp": "timestamp", "Float64Waveform": "doublewaveform",
+                "Complex128Waveform": "complexdoublewaveform",
+                "Dynamicdata": "dynamicdata", "Digitaldata": "digitaltable",
+                "DigitalWaveform": "digitalwaveform"}.get(tree.get("Flavor")) or \
+            TYPE_TO_AIXML.get("MeasureData." + (tree.get("Flavor") or ""))   # int8waveform ... (2026-11-08)
+    if t == "Picture":
+        return "picture"
+    if t in ("Set", "Map") and kids:
+        # a SET or MAP (lvheap rewrites pylabview's raw 0x73/0x74): set{T}, map{K,V}, each with
+        # its label as NI writes them (2026-11-06)
+        parts = [_sub(k) for k in kids]
+        return None if any(p is None for p in parts) else "%s{%s}" % (t.lower(), ",".join(parts))
+    if t == "Tag":
+        n = {v: k for k, v in aixml2vi.TAG_TYPES.items()}.get(tree.get("TagType"))
+        return "tag{%s}" % n if n else None
+    if t == "Refnum":
+        rt = tree.get("RefType")
+        if rt == "AutoRef":
+            return "ref{ActiveX}"       # an ActiveX refnum, whatever its interface (Excel._Application)
+        if rt == "LVObjCtl":
+            cls = ref_class_name(tree.get("CtlFlags")) or \
+                Reader.learned_classes().get("classes", {}).get((tree.get("CtlFlags") or "").upper())
+            if cls is None:
+                return None
+            if kids:
+                inner = aixml_type(kids[0])
+                return "ref{%s}{%s}" % (cls, inner) if inner else "ref{%s}" % cls
+            return "ref{%s}" % cls
+        if rt == "UDClassInst":
+            return "ref{UDClassInst}"
+        if rt == "DotNet":
+            return "ref{DotNet}"    # NI's spelling, a .NET refnum control (EventHappened.vi)
+        if rt == "VisaRef":
+            return "ref{Visa.%s}" % (tree.get("Ident") or "Instr")
+        if rt == "IVIRef" and tree.get("Ident"):
+            # an IVI instrument session, as NI's export writes niRFSA Initialize's handle
+            return "ref{IVI.%s}" % tree.get("Ident")
+        if rt == "Menu":
+            return "ref{Menu}"
+        if rt == "EventReg" and len(kids) > 1:
+            # every registered event, in order - the composer reads the list back
+            parts = [_sub(k) for k in kids]
+            return None if any(p is None for p in parts) else "ref{EventReg}{%s}" % ",".join(parts)
+        if rt == "NotifierRef":
+            rt = "Notifier"     # pylabview's name for it; NI writes ref{Notifier}{T} (14, 2026-11-06)
+        if rt == "TDMSFile":
+            return "ref{TDMSFile}"
+        if rt == "DataValueRef":
+            # a DATA VALUE REFERENCE, as NI's export writes one: ref{DataValue}{T} (VI Analyzer's
+            # Session Handle.ctl typedef, read `?TypeDef` in 51 VIs of the vi.lib sweep, 2026-11-08)
+            inner = _sub(kids[0]) if kids else None
+            return "ref{DataValue}{%s}" % inner if inner else None
+        if rt in ("DataLog", "Notifier", "Queue", "UserEvent", "EventReg", "Occurrence"):
+            inner = _sub(kids[0]) if kids else None
+            return "ref{%s}" % rt + ("{%s}" % inner if inner else "")
+        if rt == "UsrDefndTag":
+            return "ref{GenClassTag.%s.%s}" % (tree.get("Ident") or "", tree.get("TypeName") or "")
+        if rt == "UsrDefTagFlt" and tree.get("Ident") and tree.get("TypeName"):
+            # a user-defined tag FLATTEN refnum - NI Vision's IMAQ Image - as NI's export writes it:
+            # ref{GenClassTagFlatten.IMAQImage.IMAQImage} (Acquire Single Image (Snap).vi,
+            # 2026-11-13; read `?TypeDef` 46 times over the IMAQdx examples until then)
+            return "ref{GenClassTagFlatten.%s.%s}" % (tree.get("Ident"), tree.get("TypeName"))
+        if rt == "UsrDefined" and tree.get("Ident") and tree.get("TypeName"):
+            # a USER-DEFINED refnum, as NI's export writes one: ref{GenClass.<Ident>.<TypeName>}
+            # (XML DOM, TDM storage, security ... - `type Refnum.UsrDefined not mapped` in 115 VIs
+            # of the vi.lib sweep, 2026-11-08)
+            return "ref{GenClass.%s.%s}" % (tree.get("Ident"), tree.get("TypeName"))
+        return None
+    if t == "String" and tree.get("Bit3") == "1":
+        # a UTF-8 string (Bit3 on its type): NI's export writes string{utf8} (7 over its
+        # examples, Multilingual Temperature Monitor.vi, 2026-11-06)
+        return "string{utf8}"
+    k = lvheap.type_key(tree)
+    if t == "FixedPoint":
+        return "fixed"      # NI's export writes a fixed-point number bare, its word lengths dropped
+    if k and k.startswith("Unit"):
+        base = TYPE_TO_AIXML.get("Num" + k[4:])
+        if base is None:
+            return None
+        units = tree.findall("PhysUnit")
+        if units:
+            spelt = unit_text(units)
+            return "%s{%s}" % (base, spelt) if spelt else None
+        labels = [e.text or "" for e in tree.findall("EnumLabel")]
+        if labels:
+            return "%s{%s}" % (base, ",".join(escape_value(l) for l in labels))
+        return base
+    return TYPE_TO_AIXML.get(k)
+
+
+# a numeric's PHYSICAL UNIT: one <PhysUnit Val1=base Val2=exponent> per SI base unit, the exponent
+# a signed 16-bit number (65533 is -3). NI's export spells the product `m^-3 kg` - in base order,
+# separated by a space, exponent 1 bare. Measured 2026-10-15 on the cache's units: 2 = s, 3 = m,
+# 4 = kg (double{s}, double{m}, double{m^-3 kg}); the rest is LabVIEW's base-unit order and is
+# NOT measured here, so an index outside the three reads as "unknown unit" rather than a guess.
+# Base 6 is temperature: NI writes it `Cdeg` (12 of 12 over its shipping examples, the Malleable VIs'
+# Thermal Test, 2026-11-06); a Kelvin-labelled control on the same base was not among them.
+PHYS_UNITS = {2: "s", 3: "m", 4: "kg", 6: "Cdeg"}
+
+
+def unit_text(units):
+    parts = []
+    for u in sorted(units, key=lambda u: int(u.get("Val1") or 0)):
+        name = PHYS_UNITS.get(int(u.get("Val1") or -1))
+        if name is None:
+            return None
+        exp = int(u.get("Val2") or 1)
+        exp = exp - 0x10000 if exp >= 0x8000 else exp
+        parts.append(name if exp == 1 else "%s^%d" % (name, exp))
+    return " ".join(parts)
+
+
+def empty_value(tree):
+    """The value NI's export writes for a type that carries no DefaultData.
+
+    NI's exports write nothing for a type with no literal: 261 refnums, 34 waveforms, 30 dynamic
+    data, 27 timestamps, 9 variants, 7 pictures in the cache, all value="". A TYPEDEF is its
+    wrapped type and a CLUSTER its elements' literals - this answered "0" for both until
+    2026-10-14, where NI writes [0,0] for a typedef'd cluster of two doubles.
+    """
+    t = tree.get("Type")
+    kids = [c for c in tree if c.tag == "TypeDesc"]
+    if t == "TypeDef":
+        return empty_value(kids[0]) if kids else "0"
+    if t == "Cluster":
+        return "[%s]" % ",".join(empty_value(k) for k in kids)
+    if t == "Array":
+        return "[]"         # NI's exports: 356 array value=[] in the cache
+    return {"Boolean": "false"}.get(t, "" if t in (
+        "String", "Path", "Refnum", "Picture", "MeasureData", "LVVariant", "Tag") else "0")
+
+
+def string_block_text(el):
+    """The text of a pylabview string block such as STRG's description. A MULTI-LINE one is
+    written as <Chunk> lines joined by its EOLN attribute ("LF", "CRLF"), a chunk possibly as
+    Storage="hex" - LVblock.initWithXMLSingleString. Reading only the element's own text gave the
+    indentation between the chunks, so every multi-line VI description came back as whitespace
+    (15 of 40 cached NI examples, 2026-10-14)."""
+    if el is None:
+        return ""
+
+    def one(c):
+        if c.get("Storage") == "hex":
+            return bytes.fromhex(c.text or "").decode("mac_roman")
+        # a byte pylabview could not print is the literal text `&#xNN;` - a CR in DW Test
+        # Copy.vi's description, which NI writes as a CR (2026-11-06)
+        return re.sub(r"&#x([0-9A-Fa-f]{2});", lambda m: chr(int(m.group(1), 16)), c.text or "")
+    chunks = el.findall("Chunk")
+    if not chunks:
+        return one(el)
+    eoln = (el.get("EOLN") or "LF").replace("CR", "\r").replace("LF", "\n")
+    return eoln.join(one(c) for c in chunks)
+
+
+def escape_description(s):
+    """NI's escaping inside description=, counted over the cached exports: ',' and ':' and the
+    control characters as a backslash plus two hex digits (909 \\2C, 163 \\3A, 866 \\0A on VI
+    descriptions), a backslash DOUBLED, everything else raw - ']' included, unlike a value."""
+    return "".join("\\\\" if c == "\\" else ("\\%02X" % ord(c) if ord(c) < 0x20 or c in ",:" else c) for c in s)
+
+
+def escape_value(v):
+    """NI's escaping inside value= and type literals, counted over 1 584 cached exports:
+    control characters, ',' and ']' become a backslash plus two hex digits; ':' and ';' stay raw.
+    A BACKSLASH is DOUBLED - this said `\\5C` until 2026-10-12, and NI's exports hold 0 values with
+    `\\5C` against 100 with `\\\\` (76 paths `..\\\\lvcanvas.html`, 21 strings `[\\\\t\\\\n...`), which
+    aixml2vi.unescape reads back as one backslash."""
+    return "".join("\\\\" if c == "\\" else ("\\%02X" % ord(c) if ord(c) < 0x20 or c in ",]" else c) for c in v)
+
+
+def fmt_float(v):
+    # lower case, as NI's exporter writes them: 8 nan and 18 inf/-inf in the cached exports and
+    # not one NaN or Inf (2026-10-15)
+    if v != v:
+        return "-nan" if math.copysign(1.0, v) < 0 else "nan"   # NI keeps the sign bit
+    if v in (float("inf"), float("-inf")):
+        return "inf" if v > 0 else "-inf"
+    return "%.17g" % v
+
+
+def decode_value(tree, hexstr):
+    try:
+        return _decode_value(tree, hexstr)
+    except (struct.error, IndexError, ValueError):
+        return None   # an encoding this reader does not know; the caller notes it
+
+
+def _unquad(b):
+    """IEEE binary128, big-endian -> float (the inverse of the composer's _quad)."""
+    if len(b) < 16 or not any(b):
+        return 0.0
+    hi = int.from_bytes(b[:2], "big")
+    sign, exp = hi >> 15, hi & 0x7FFF
+    frac = int.from_bytes(b[2:16], "big")
+    if exp == 0x7FFF:
+        # a fraction makes it a NaN, not an infinity (Mean (CDB).vi-style NaN defaults, sweep of
+        # vi.lib 2026-11-08); the sign is kept like fmt_float keeps it
+        if frac:
+            return math.copysign(float("nan"), -1.0 if sign else 1.0)
+        return float("-inf") if sign else float("inf")
+    v = (1 + frac / float(1 << 112)) * 2.0 ** (exp - 16383)
+    return -v if sign else v
+
+
+def _fmt_complex(re_, im):
+    if im == 0:
+        return fmt_float(re_)
+    # the imaginary part always carries its sign: a NaN one was written `nannani` until
+    # 2026-11-08 (`nan` is not >= 0 and has no `-`), which no reader of the value could split
+    t = fmt_float(im)
+    return "%s%s%si" % (fmt_float(re_), "" if t.startswith("-") else "+", t)
+
+
+def _flat_decode(tree, b, pos):
+    """One flattened value -> (AIXML text, next position): the inverse of the composer's
+    _flat - an array is an int32 size per dimension then its elements, a cluster its fields one
+    after the other; written as NI writes compound values: [a,b], nested, booleans lower case."""
+    t = tree.get("Type")
+    kids = [c for c in tree if c.tag == "TypeDesc"]
+    if t == "TypeDef":
+        return _flat_decode(kids[0], b, pos)
+    if t == "Array":
+        dims = len(tree.findall("Dimension")) or 1
+        sizes = list(struct.unpack(">%di" % dims, b[pos:pos + 4 * dims]))
+        pos += 4 * dims
+        total = 1
+        for n in sizes:
+            total *= n
+        flat = []
+        for _ in range(total):
+            v, pos = _flat_decode(kids[0], b, pos)
+            flat.append(v)
+
+        def nest(items, ds):
+            if len(ds) == 1:
+                return "[%s]" % ",".join(items)
+            step = len(items) // ds[0] if ds[0] else 0
+            return "[%s]" % ",".join(nest(items[i * step:(i + 1) * step], ds[1:]) for i in range(ds[0]))
+        return ("[]" if total == 0 else nest(flat, sizes)), pos
+    if t == "Cluster":
+        parts = []
+        for k in kids:
+            v, pos = _flat_decode(k, b, pos)
+            parts.append(v)
+        return "[%s]" % ",".join(parts), pos
+    if t and t.startswith("Unit"):
+        t = "Num" + t[4:]
+    if t == "Boolean":
+        return ("true" if b[pos] else "false"), pos + 1
+    if t == "NumFloat64":
+        return fmt_float(struct.unpack(">d", b[pos:pos + 8])[0]), pos + 8
+    if t == "NumFloat32":
+        return fmt_float(struct.unpack(">f", b[pos:pos + 4])[0]), pos + 4
+    if t == "NumFloatExt":
+        return fmt_float(_unquad(b[pos:pos + 16])), pos + 16
+    if t in ("NumComplex128", "NumComplex64"):
+        n = 8 if t == "NumComplex128" else 4
+        f = ">d" if n == 8 else ">f"
+        re_, im = struct.unpack(f, b[pos:pos + n])[0], struct.unpack(f, b[pos + n:pos + 2 * n])[0]
+        return _fmt_complex(re_, im), pos + 2 * n
+    if t == "NumComplexExt":
+        # two binary128 halves, real first - the composer's _quad twice
+        return _fmt_complex(_unquad(b[pos:pos + 16]), _unquad(b[pos + 16:pos + 32])), pos + 32
+    if t in INT_FMT:
+        n = struct.calcsize(INT_FMT[t])
+        return str(struct.unpack(INT_FMT[t], b[pos:pos + n])[0]), pos + n
+    if t == "String":
+        n = struct.unpack(">I", b[pos:pos + 4])[0]
+        return escape_value(lvheap.value_text(b[pos + 4:pos + 4 + n])), pos + 4 + n
+    if t == "Path":
+        n = struct.unpack(">I", b[pos + 4:pos + 8])[0]
+        return _decode_value(tree, b[pos:pos + 8 + n].hex()), pos + 8 + n
+    # Measured 2026-10-15 on the cluster constants the reader left undecoded (63 in the cache): a
+    # REFNUM in a constant is four bytes and NI writes it empty; a PICTURE is length-prefixed like
+    # a string; an EMPTY variant is the 20 bytes below and NI writes it empty too. A variant that
+    # holds data is not decoded - its layout was not measured.
+    if t == "Refnum":
+        if len(b) < pos + 4:
+            raise ValueError("refnum past the end")
+        return "", pos + 4
+    if t == "Picture":
+        n = struct.unpack(">I", b[pos:pos + 4])[0]
+        return escape_value(lvheap.value_text(b[pos + 4:pos + 4 + n])), pos + 4 + n
+    if t == "MeasureData" and lvheap.type_key(tree) == "MeasureData.TimeStamp":
+        # a TIMESTAMP in a cluster: 16 bytes, written EMPTY by NI as on its own (`[0,Doe,John,]`,
+        # the Channels sorting examples, 2026-11-06) - the cluster was left undecoded until then
+        return "", pos + 16
+    if t == "LVVariant":
+        if b[pos + 4:pos + 20] == EMPTY_VARIANT_TAIL:
+            return "", pos + 20
+        raise ValueError("a variant holding data")
+    raise ValueError("no flattened form known for %s" % t)
+
+
+def _unwrap(tree):
+    while tree is not None and tree.get("Type") == "TypeDef" and tree.find("TypeDesc") is not None:
+        tree = tree.find("TypeDesc")
+    return tree
+
+
+def _label(tree):
+    return tree.get("Label") or (_unwrap(tree).get("Label") if _unwrap(tree) is not None else None)
+
+
+def mutate_value(old, new, b, pos):
+    """A value flattened against type `old`, as LabVIEW carries it into type `new` - the same
+    type: as it is; two clusters: field by field, MATCHED BY LABEL, a field `new` gained written
+    as its empty value, one it lost dropped; two enums: the same ITEM at its new place, else the
+    number clamped to the new list;
+    two arrays of as many dimensions: element by element; anything else: None (not carried).
+    -> (text, next position in b)."""
+    if aixml_type(old) == aixml_type(new):
+        return _flat_decode(old, b, pos)
+    o, n = _unwrap(old), _unwrap(new)
+    if o is None or n is None:
+        return None, _flat_decode(old, b, pos)[1]
+    o_items = [e.text or "" for e in o.findall("EnumLabel")]
+    n_items = [e.text or "" for e in n.findall("EnumLabel")]
+    if o_items and n_items:
+        # an ENUM: LabVIEW keeps the ITEM where the new list still has it, else the NUMBER,
+        # clamped to the new list's last item - measured on Issue136Enum, NI's export after each
+        # .ctl was saved alone (2026-11-18): Stop of {Init,Run,Stop} in {Init,Pause,Run,Stop} is 3;
+        # Run (1) of {Off,Run,Stop} in {Off,Stop} is 1 (Stop); High (2) of {Low,Mid,High} in
+        # {Low,Mid} is 1 (Mid)
+        v, end = _flat_decode(o, b, pos)
+        if not v.lstrip("-").isdigit():
+            return None, end
+        k = int(v)
+        item = o_items[k] if 0 <= k < len(o_items) else None
+        return str(n_items.index(item) if item in n_items else max(0, min(k, len(n_items) - 1))), end
+    if o.get("Type") == "Array" and n.get("Type") == "Array" and \
+            len(o.findall("Dimension")) == len(n.findall("Dimension")):
+        # an ARRAY: its sizes as saved, each element carried over on its own
+        dims = len(o.findall("Dimension")) or 1
+        sizes = list(struct.unpack(">%di" % dims, b[pos:pos + 4 * dims]))
+        pos += 4 * dims
+        total = 1
+        for x in sizes:
+            total *= x
+        ok, ek = _wrapped(o), _wrapped(n)
+        items = []
+        for _ in range(total):
+            v, pos = mutate_value(ok, ek, b, pos)
+            items.append(v)
+        if any(v is None for v in items):
+            return None, pos
+
+        def nest(xs, ds):
+            if len(ds) == 1:
+                return "[%s]" % ",".join(xs)
+            step = len(xs) // ds[0] if ds[0] else 0
+            return "[%s]" % ",".join(nest(xs[i * step:(i + 1) * step], ds[1:]) for i in range(ds[0]))
+        return ("[]" if total == 0 else nest(items, sizes)), pos
+    if o.get("Type") != "Cluster" or n.get("Type") != "Cluster":
+        return None, _flat_decode(old, b, pos)[1]
+    fields = {}
+    for k in (c for c in o if c.tag == "TypeDesc"):
+        fields.setdefault(_label(k), (k, pos))
+        pos = _flat_decode(k, b, pos)[1]
+    parts = []
+    for k in (c for c in n if c.tag == "TypeDesc"):
+        hit = fields.get(_label(k)) if _label(k) else None
+        v = mutate_value(hit[0], k, b, hit[1])[0] if hit is not None else None
+        parts.append(v if v is not None else empty_value(k))
+    return "[%s]" % ",".join(parts), pos
+
+
+# an EMPTY variant flattened, after its 4-byte version word (0x26008000 in LabVIEW 2026): one type,
+# void (`0004 0000`), then `0001 0000`, no data and no attributes
+EMPTY_VARIANT_TAIL = bytes.fromhex("00000001000400000001000000000000")
+
+
+def _decode_value(tree, hexstr):
+    if tree.get("Type") == "TypeDef" and tree.find("TypeDesc") is not None:
+        return _decode_value(tree.find("TypeDesc"), hexstr)
+    if tree.get("Type") in ("Array", "Cluster", "NumFloatExt", "NumComplex128", "NumComplex64", "NumComplexExt",
+                            "Picture", "LVVariant"):
+        # LVVariant on its own: an EMPTY variant, as inside a cluster - 21 of 21 sampled in the
+        # 139 VIs of the vi.lib sweep that noted one (2026-11-08); one holding data still raises
+        return _flat_decode(tree, bytes.fromhex(hexstr) if hexstr else b"", 0)[0]
+    if tree.get("Type") == "MeasureData" and lvheap.type_key(tree) == "MeasureData.TimeStamp":
+        # a TIMESTAMP constant: AIXML carries none and NI writes it empty. The ZERO time is that
+        # empty value, so it is no loss (11 of 12 sampled, vi.lib sweep 2026-11-08); any other
+        # stays undecoded and noted - the composer would write zero
+        b = bytes.fromhex(hexstr) if hexstr else b""
+        return "" if not any(b[:16]) else None
+    t = tree.get("Type")
+    if t and t.startswith("Unit"):
+        t = "Num" + t[4:]   # a ring or enum holds its base number
+    b = bytes.fromhex(hexstr) if hexstr else b""
+    if t == "Refnum" and not any(b):
+        # a REFNUM constant on its own, as inside a cluster: NI writes it empty - five zero bytes
+        # in webdoc.llb's Size Strings.vi, where the cluster rule had only ever seen four
+        return ""
+    if t == "Refnum" and len(b) >= 4 and struct.unpack(">I", b[:4])[0] == len(b) - 4:
+        # a VISA (or IVI) resource name: a length-prefixed string, which NI writes as the name -
+        # `GPIB0::2::INSTR` (GPIB with VISA functions.vi, 2026-11-06)
+        return escape_value(lvheap.value_text(b[4:]))
+    size = {"NumFloat64": 8, "NumFloat32": 4}.get(t) or (struct.calcsize(INT_FMT[t]) if t in INT_FMT else None)
+    if size and len(b) > size:
+        b = b[:size]
+    if t == "NumFloat64":
+        # LabVIEW's own export writes 17 significant digits: 0.2 is "0.20000000000000001"
+        return fmt_float(struct.unpack(">d", b)[0]) if b else "0"
+    if t == "NumFloat32":
+        return fmt_float(struct.unpack(">f", b)[0]) if b else "0"
+    if t in INT_FMT:
+        return str(struct.unpack(INT_FMT[t], b)[0]) if b else "0"
+    if t == "Boolean":
+        return "true" if b and b[0] else "false"
+    if t in ("String", "Tag"):
+        n = struct.unpack(">I", b[:4])[0] if b else 0
+        return escape_value(lvheap.value_text(b[4:4 + n]))
+    if t == "Path":
+        if len(b) < 12:
+            return ""
+        kind, count = struct.unpack(">HH", b[8:12])
+        comps, i = [], 12
+        for _ in range(count):
+            n = b[i]
+            comps.append(lvheap.value_text(b[i + 1:i + 1 + n]))
+            i += 1 + n
+        if kind == 0 and comps:
+            return escape_value(comps[0] + ":\\" + "\\".join(comps[1:]))
+        # a relative path's EMPTY component is one level up, which NI writes `..`
+        # (`..\\support\\sample.wav`, Excel - Macro.vi)
+        return escape_value("\\".join(c if c else ".." for c in comps))
+    return None
+
+
+# DyOM is a DYNAMIC DISPATCH call (a dynIUse node): its offset names the node's dynLink child
+LINK_TAGS = (b"IUVI", b"PUPV", b"SVVI", b"IUCI", b"CCCI", b"DNDP", b"DyOM")
+
+# every record identifier pylabview knows (LVlinkinfo.py), less the path tags inside a record -
+# where one record ends is where the next one's identifier starts
+RECORD_TAGS = tuple(t.encode() for t in (
+    "AP2A AP2C AP2I AXDT AXTL AXVT BSVR C2Pr C2VI C2vi CBMS CCCC CCLO CILO CLIB CMem DDPI DNDA "
+    "DNVA DOPI DRPI DSCB DSCN DSDS DSEF DSSC DSSV DSVl DSVr DyOM EiVr FBIV FPHP FPPI GIAY GINT "
+    "GIVI GUGV H2CC H2LD HEIR HOPI HOXF HVIR HXCI HXNI HpCI HpEr HpEx HpFN HpFl HpVI HpVL HpVr "
+    "IUIV IUPR IUVI IVGV IVOV LIBR LVCC LVIN LVPR LVSB LVXC MNMS MSIM MUDF NCIN NEXF NSCR OBDR "
+    "OVIR OXTR PNOM POLY PUPV RCFL RFil RVPI SCVI SFTB SVVI TDCC UDPI V2CC V2LD VIAV VICC VICI "
+    "VIDS VIFN VIFl VIGV VIIV VILB VIMS VIPI VIPR VIPV VIRC VIVI VIVl VIVr VIXC VIXF VIXN VRPI "
+    "VTVN XCXI XFil XFun XHPR XIMD XINT XIPY XNDI XNEF XNFP XNVI XNXI XPLO XVPR IUCI CCCI DNDP"
+).split())
+
+
+def _pascal_names(data, j, n):
+    """n Pascal strings from j: ([bytes], index after them), or (None, j) when they overrun."""
+    names = []
+    for _ in range(n):
+        if j >= len(data):
+            return None, j
+        ln = data[j]
+        if j + 1 + ln > len(data):
+            return None, j
+        names.append(data[j + 1:j + 1 + ln])
+        j += 1 + ln
+    return names, j
+
+
+def _expand_nested(name):
+    """A DyOM record's method name is itself a qualified name - b'\\x01\\x0eWrite Width.vi' is
+    one Pascal string - so a name that parses EXACTLY as a count and that many strings is
+    replaced by them."""
+    if len(name) >= 2 and 1 <= name[0] <= 4:
+        inner, end = _pascal_names(name, 1, name[0])
+        if inner is not None and end == len(name) and all(inner):
+            return inner
+    return [name]
+
+
+def _nested_text(text):
+    """A qualified-name string as pylabview writes it - unprintable bytes as literal `&#xNN;` -
+    back to its bytes, then expanded like a binary record's nested name."""
+    raw = re.sub(r"&#x([0-9A-Fa-f]{2});", lambda m: chr(int(m.group(1), 16)), text)
+    return [x.decode("mac_roman", "replace") for x in _expand_nested(raw.encode("mac_roman", "replace"))]
+
+
+def binary_link_records(data):
+    """[(node uid, record tag, qualified name)] read straight out of a binary LIbd block, for
+    the records that name diagram nodes. A record is its tag, a uint16 count of Pascal strings
+    (the qualified name) two to six bytes later, a PTH0 path, more fields, and the
+    LinkOffsetList - a uint32 count and that many uint32 uids. Read off LUnit's Test
+    Failing.vi, where the count sat at tag+8, and off a LabVIEW-saved Caraya test calling class
+    accessors (2026-10-11), where it sat at tag+6 - and at tag+7 for a record LabVIEW wrote at
+    an ODD offset, so the count is found, not assumed. The offset list sits right before the
+    record's second PTH0 (the library path) for a static call; a DyOM record has no second path
+    and ends with it, before the next record's identifier. Heuristic by construction: a record
+    whose layout differs yields nothing rather than a wrong name."""
+    out = []
+    for tag in LINK_TAGS:
+        start = 0
+        while True:
+            i = data.find(tag, start)
+            if i < 0:
+                break
+            start = i + 4
+            names = j = None
+            for s in range(i + 6, i + 12):
+                n = int.from_bytes(data[s - 2:s], "big")
+                if not 1 <= n <= 6:
+                    continue
+                cand, end = _pascal_names(data, s, n)
+                if not cand or not cand[-1].lower().endswith((b".vi", b".vim", b".ctl", b".vit")):
+                    continue
+                p = data.find(b"PTH0", end)
+                if 0 <= p and p - end <= 8:
+                    names, j = cand, end
+                    break
+            if names is None:
+                continue
+            names = [x.decode("mac_roman", "replace") for nm in names for x in _expand_nested(nm)]
+            p1 = data.find(b"PTH0", j)
+            ln = int.from_bytes(data[p1 + 4:p1 + 8], "big")
+            path_end = p1 + 8 + ln
+            # LinkSaveFlag: the uint32 right after the path (pylabview's BasicLinkSaveInfo) - 2
+            # means the name is relative to the CALLER's library
+            flag = int.from_bytes(data[path_end:path_end + 4], "big") if path_end + 4 <= len(data) else None
+            path = _path_components(data[p1:path_end])
+            nxt = min([k for k in (data.find(t, i + 4) for t in RECORD_TAGS) if k > 0] or [len(data)])
+            p2 = data.find(b"PTH0", path_end)
+            if 0 <= p2 < nxt:
+                end, floor = p2, p1
+            else:
+                # no library path in this record: the offset list ends it, before the uint16
+                # that precedes the next identifier
+                end = nxt - 2 if data[nxt - 2:nxt] == b"\x00\x02" else nxt
+                floor = path_end
+            for k in range(1, 64):
+                at = end - 4 * k - 4
+                if at <= floor:
+                    break
+                if int.from_bytes(data[at:at + 4], "big") == k:
+                    offs = [int.from_bytes(data[at + 4 + 4 * m:at + 8 + 4 * m], "big") for m in range(k)]
+                    out.extend((o, tag.decode(), ":".join(names), flag, path) for o in offs)
+                    break
+    return out
+
+
+def _path_components(b):
+    """A flattened PTH0 path -> (type, [components]): type 0 absolute (an anchor such as `<vilib>`
+    first), 1 relative to the caller FILE with "" for each level up. None if it is not one."""
+    if len(b) < 12 or b[:4] != b"PTH0":
+        return None
+    kind, count = struct.unpack(">HH", b[8:12])
+    comps, i = [], 12
+    for _ in range(count):
+        if i >= len(b):
+            return None
+        n = b[i]
+        comps.append(b[i + 1:i + 1 + n].decode("mac_roman", "replace"))
+        i += 1 + n
+    return kind, comps
+
+
+_RESOLVER = None
+_CALLEE_SLOTS = {}
+
+
+def link_file(path, caller_file):
+    """A link's path -> the callee's file on this machine, or None: an anchored one through the
+    installation's and the LVAddons' trees (resolve.py), a relative one from the caller's file."""
+    global _RESOLVER
+    if not path:
+        return None
+    kind, comps = path
+    if not comps:
+        return None
+    if comps[0].startswith("<") and comps[0].endswith(">"):
+        if _RESOLVER is None:
+            import resolve
+            _RESOLVER = resolve.Resolver()
+        import resolve
+        for anchor, d in _RESOLVER.roots:
+            if anchor == comps[0]:
+                # a path through an .llb CONTAINER (every DAQmx link) is read from its extracted member
+                p = resolve.materialize(os.path.join(d, *comps[1:]))
+                if p:
+                    return p
+        return None
+    if kind == 0:
+        p = os.path.join(comps[0] + "\\", *comps[1:]) if len(comps[0]) == 2 and comps[0][1] == ":" else None
+        return p if p and os.path.exists(p) else None
+    if not caller_file:
+        return None
+    p = caller_file
+    for c in comps:
+        p = os.path.dirname(p) if c == "" else os.path.join(p, c)
+    if os.path.isfile(p):
+        return p
+    # a sibling inside the same .llb container file as a caller read from one
+    import resolve
+    m = resolve.materialize(p)
+    return m if m and os.path.isfile(m) else None
+
+
+def callee_slots(path):
+    """A VI file -> {conIdx: terminal label}, read off its front panel heap: the pane's `cons`
+    array (sparse - an element carries `index=` only where it jumps) names each slot's fPDCO, and
+    the fPDCO's own label is the terminal's name. Cached per file; {} when it cannot be read."""
+    if path in _CALLEE_SLOTS:
+        return _CALLEE_SLOTS[path]
+    out = {}
+    tmp = tempfile.mkdtemp(prefix="callee_")
+    try:
+        cp = os.path.join(tmp, "c" + os.path.splitext(path)[1])
+        real = path
+        if not os.path.exists(real):
+            # a member of an .llb CONTAINER file, its path running through the .llb
+            import resolve
+            real = resolve.materialize(path) or path
+        shutil.copyfile(real, cp)
+        b = lvheap.Bundle(lvheap.extract(cp, tmp))
+        dcos = {e.get("uid"): e for e in b.fp.iter("SL__arrayElement") if e.get("class") == "fPDCO"}
+        cons = next(b.fp.iter("cons"), None)
+        cursor = 0
+        for c in (cons if cons is not None else []):
+            if c.get("index") is not None:
+                cursor = int(c.get("index"))
+            dco = c.find("ConnectionDCO")
+            f = dcos.get(dco.get("uid")) if dco is not None else None
+            if f is not None and f.find("ddo") is not None:
+                out[cursor] = label_text(f.find("ddo"))
+            cursor += 1
+    except Exception:
+        out = {}
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    _CALLEE_SLOTS[path] = out
+    return out
+
+
+def qualify_link(qual, flag, caller_libs):
+    """A link record's qualified name, completed by the caller's own libraries (LIBN) where its
+    LinkSaveFlag says it was saved RELATIVE to them (Reader._relative_to_caller has the cases)."""
+    if not caller_libs or not qual:
+        return qual
+    if flag == "2" and len(qual) == 1:
+        return caller_libs + qual
+    if flag == "2":
+        if qual[0] in caller_libs:
+            return caller_libs[:caller_libs.index(qual[0])] + qual
+        return caller_libs + qual
+    if flag == "3":
+        return caller_libs[:1] + qual
+    return qual
+
+
+# A linked TYPEDEF as its .ctl holds it now, per file state (_file_key) -> _ctl_typedef's answer.
+# In linkcache, so the resident worker keeps it across reads: each .ctl is extracted once.
+_TYPEDEF_CACHE = linkcache.TYPEDEFS
+
+# Whether every linked file is read, or only one written AFTER the file that holds its copy
+# (newer_than). `--full-link-check` or LABVIEWMCP_FULL_LINK_CHECK=1 sets it, per read (main).
+FULL_LINK_CHECK = False
+LINK_STATS = {"read": set(), "skippedByDate": set()}   # linked FILES, normcased
+
+
+def _file_key(path):
+    """A file's state as a cache key: path, write time, size - and the link-check mode, since the
+    answer for a file depends on which of ITS links were read."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (os.path.normcase(os.path.abspath(path)), st.st_mtime_ns, st.st_size, FULL_LINK_CHECK)
+
+
+def newer_than(linked, holder):
+    """Whether `linked` - a typedef's .ctl, a subVI - may have changed since `holder`, the file
+    that saved a copy of it, was saved. LabVIEW writes the CURRENT definition into the copy when it
+    saves the holder, so a linked file written BEFORE the holder needs no reading (the user's
+    proposal of 2026-11-18). Every one of the nine stale DQMH callers of the ATM build has an older
+    write time than the .ctl and subVI it is stale against, and its Main.vi, newer than all 11 of
+    its links, then reads none. A write time says nothing after a git checkout, which writes every
+    file anew in no particular order: FULL_LINK_CHECK reads them all. Unknown times read."""
+    if FULL_LINK_CHECK or not holder:
+        return True
+    try:
+        return os.stat(linked).st_mtime_ns > os.stat(holder).st_mtime_ns
+    except OSError:
+        return True
+
+
+def _type_shape(tree, top=True):
+    """A type's structure for comparing an embedded typedef copy with its .ctl: every attribute but
+    how pylabview laid it out (Format) and the outermost label - that one belongs to the INSTANCE
+    (a typedef'd control relabelled in its caller keeps the typedef), not to the typedef."""
+    attrs = tuple(sorted((k, v) for k, v in tree.attrib.items()
+                         if k not in ("Format", "Nested") and not (top and k in ("Label", "HasLabel"))))
+    kids = tuple(_type_shape(c, False) if c.tag == "TypeDesc" else (c.tag, tuple(sorted(c.attrib.items())))
+                 for c in tree)
+    return (attrs, kids)
+
+
+def _wrapped(typedef):
+    return next((c for c in typedef if c.tag == "TypeDesc"), None)
+
+
+def _ctl_typedef(path, chain=()):
+    """(the TypeDef a .ctl defines, fully inlined with ITS linked typedefs resolved from disk too,
+    or None; {qualified name: finding} of those nested typedefs; why it is None, else None). Its
+    CONP points at that TypeDef (Reader.pane_flags)."""
+    key = _file_key(path)
+    if key is None:
+        return None, {}, "the file is gone"
+    if key in _TYPEDEF_CACHE:
+        return _TYPEDEF_CACHE[key]
+    if key in chain:
+        return None, {}, "it contains itself through its links"
+    tmp = tempfile.mkdtemp(prefix="typedef_")
+    result = (None, {}, None)
+    try:
+        b = lvheap.Bundle(lvheap.extract(path, tmp), collections=True)
+        libs = [l.text.strip() for l in b.main.findall("LIBN/Section/Library") if (l.text or "").strip()]
+        links = TypedefLinks(b, path, libs, chain + (key,))
+        b.typedef_resolver = links
+        cons = b.main.find("CONP/Section/TypeDesc")
+        tree = b.tree(b.flat_of_consolidated(int(cons.get("TypeID")))) if cons is not None else None
+        result = (tree if tree is not None and tree.get("Type") == "TypeDef" else None, dict(links.findings),
+                  None if tree is not None else "it has no connector pane type")
+    except Exception as ex:
+        result = (None, {}, "%s: %s" % (type(ex).__name__, str(ex)[:300]))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    _TYPEDEF_CACHE[key] = result
+    return result
+
+
+def typedef_name(tree):
+    """The qualified name of the linked typedef a type IS, else None."""
+    if tree is None or tree.get("Type") != "TypeDef":
+        return None
+    return ":".join(l.get("Text") or "" for l in tree.findall("Label")) or None
+
+
+def link_target_text(path, caller_file):
+    """Where a link points, for a message: a relative one resolved from the caller's file."""
+    kind, comps = path
+    if kind == 1 and caller_file:
+        where = caller_file
+        for c in comps:
+            where = os.path.dirname(where) if c == "" else os.path.join(where, c)
+        return where
+    return "\\".join(comps)
+
+
+def read_files_at_once(files, read):
+    """`read(file)` for each file, eight at a time where each pylabview extraction is its own
+    PROCESS (about 0.7 s each, mostly the start). Not in the server's resident worker
+    (worker.py): it swaps lvheap.run_pylabview for an in-process run that swaps sys.argv and
+    stdout, and threads there failed every extraction with an empty message (2026-11-18) - there
+    they are read one by one, with no process start to save. Plain threads: the bundled Python
+    ships no `concurrent` package (13 suite failures, ModuleNotFoundError, 2026-11-18)."""
+    files = list(files)
+    if len(files) < 2 or getattr(lvheap.run_pylabview, "__module__", None) != lvheap.__name__:
+        for f in files:
+            read(f)
+        return
+    import threading
+    lock = threading.Lock()
+
+    def work():
+        while True:
+            with lock:
+                if not files:
+                    return
+                f = files.pop()
+            read(f)
+    threads = [threading.Thread(target=work) for _ in range(min(8, len(files)))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+
+# A subVI's connector pane as its FILE defines it now, per file state (_file_key): (slot ->
+# (label, is an output, AIXML type), or None; why it is None). Cached for the read like typedefs.
+_CALLEE_PANES = linkcache.CALLEE_PANES
+
+
+def callee_pane(path):
+    """A callee file -> ({slot: (label, is an output, AIXML type, typedef name or None)}, None) or
+    (None, why).
+    The slot's fPDCO comes from the front panel's `cons` array as in callee_slots, its type from
+    the pane's Function type - with the callee's OWN linked typedefs resolved from disk."""
+    key = _file_key(path)
+    if key is None:
+        return None, "the file is gone"
+    if key in _CALLEE_PANES:
+        return _CALLEE_PANES[key]
+    tmp = tempfile.mkdtemp(prefix="callee_pane_")
+    result = (None, "unread")
+    try:
+        b = lvheap.Bundle(lvheap.extract(path, tmp), collections=True)
+        libs = [l.text.strip() for l in b.main.findall("LIBN/Section/Library") if (l.text or "").strip()]
+        b.typedef_resolver = TypedefLinks(b, path, libs)
+        cons = b.main.find("CONP/Section/TypeDesc")
+        func = b.tree(b.flat_of_consolidated(int(cons.get("TypeID")))) if cons is not None else None
+        if func is None or func.get("Type") != "Function":
+            result = (None, "it has no connector pane")
+        else:
+            types = [c for c in func if c.tag == "TypeDesc"]
+            dcos = {e.get("uid"): e for e in b.fp.iter("SL__arrayElement") if e.get("class") == "fPDCO"}
+            pane, cursor = {}, 0
+            cl = next(b.fp.iter("cons"), None)
+            for c in (cl if cl is not None else []):
+                if c.get("index") is not None:
+                    cursor = int(c.get("index"))
+                dco = c.find("ConnectionDCO")
+                f = dcos.get(dco.get("uid")) if dco is not None else None
+                if f is not None and f.find("ddo") is not None and cursor < len(types)                         and types[cursor].get("Type") not in (None, "Void"):
+                    t = types[cursor]
+                    pane[cursor] = (label_text(f.find("ddo")), bool(int(f.findtext("objFlags") or 0) & 1),
+                                    aixml_type(t) or lvheap.type_key(t), typedef_name(t))
+                cursor += 1
+            result = (pane, None)
+    except Exception as ex:
+        result = (None, "%s: %s" % (type(ex).__name__, str(ex)[:300]))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    _CALLEE_PANES[key] = result
+    return result
+
+
+class TypedefLinks:
+    """Resolves the LINKED TYPEDEFS a file embeds from their .ctl files on disk (issue #136).
+
+    A VI - and a .ctl - saves a COPY of every typedef it uses, nested ones too, and LabVIEW
+    replaces that copy from the .ctl when it loads the file. A .ctl edited and saved on its own
+    leaves its callers' copies stale until they are saved again: Context Help then shows the new
+    fields, and a reader of the copy the old ones. So each TypeDef is matched by its qualified
+    name (its Label children) to the file's TDCC link record, the .ctl is read - its own nested
+    typedefs resolved the same way, recursively - and the TypeDef is answered as the .ctl defines
+    it. What does not resolve keeps the copy, and both cases are recorded in `findings`:
+      drift      - the copy differs from the .ctl; the .ctl's definition is the one used,
+      unresolved - the link's .ctl is not there or cannot be read; the copy is used and is an
+                   UNVERIFIED snapshot.
+    A TypeDef no TDCC of the file names is not one of its links (a callee's pane type, an event's
+    data) and is read as embedded, unreported.
+    A class's private data cluster is a TypeDef too, with a non-zero Flag1 (Delacor's Message
+    Queue.ctl in every DQMH Main.vi, 0xE5C5AD3E) and no TDCC: it is left to the class reading."""
+
+    def __init__(self, bundle, file_path, caller_libs, chain=()):
+        self.file_path = file_path
+        self.chain = chain
+        self.by_qual = {}
+        self.by_name = {}
+        for rec in bundle.main.iter("TDCC"):
+            qual = [s.text or "" for s in rec.findall("LinkSaveQualName/String")]
+            pr = rec.find("LinkSavePathRef")
+            if not qual or pr is None:
+                continue
+            path = (int(pr.get("TpVal") or "0"), [s.text or "" for s in pr.findall("String")])
+            self.by_qual.setdefault(tuple(qualify_link(qual, rec.get("LinkSaveFlag"), caller_libs)), path)
+            self.by_name.setdefault(qual[-1], []).append(path)
+        self.findings = {}
+        self._files = {}
+        self._prefetch(bundle)
+
+    @staticmethod
+    def _names(src):
+        return [l.get("Text") or "" for l in src.findall("Label")]
+
+    def _is_linked_typedef(self, src, names):
+        if not names or not names[-1].lower().endswith((".ctl", ".ctt")):
+            return False
+        try:
+            if int(src.get("Flag1") or "0", 16) != 0:
+                return False         # a class's private data
+        except ValueError:
+            return False
+        # a .ctl's OWN TypeDef is the definition, not a copy of one
+        return not (self.file_path and names[-1].lower() == os.path.basename(self.file_path).lower())
+
+    def _link(self, names):
+        path = self.by_qual.get(tuple(names))
+        if path is None:
+            cands = {(k, tuple(c)) for k, c in self.by_name.get(names[-1], [])}
+            if len(cands) == 1:
+                k, c = next(iter(cands))
+                path = (k, list(c))
+        return path
+
+    def _file(self, names):
+        key = tuple(names)
+        if key not in self._files:
+            path = self._link(names)
+            self._files[key] = (path, link_file(path, self.file_path) if path is not None else None)
+        return self._files[key]
+
+    def _prefetch(self, bundle):
+        """Read every linked .ctl of this file at once: an extraction is a pylabview process of
+        about 0.7 s, and a DQMH Main.vi links a dozen typedefs."""
+        files = set()
+        for td in bundle.flat:
+            names = self._names(td)
+            if td.get("Type") == "TypeDef" and self._is_linked_typedef(td, names):
+                f = self._file(names)[1]
+                if f and _file_key(f) not in _TYPEDEF_CACHE and newer_than(f, self.file_path):
+                    files.add(f)
+        read_files_at_once(sorted(files), lambda f: _ctl_typedef(f, self.chain))
+
+    def __call__(self, src, snap):
+        names = self._names(src)
+        if not self._is_linked_typedef(src, names):
+            return None
+        name = ":".join(names)
+        path, f = self._file(names)
+        if path is None:
+            # not a link of THIS file: a copy inside a callee's pane type or an event's data
+            # (DQMH Main.vi's Show Panel Argument, LabVIEW's lveventtype.ctl - 7 of 18 there,
+            # 2026-11-18), which LabVIEW refreshes through that owner, not through a .ctl link
+            return None
+        if f is None:
+            self.findings.setdefault(name, ("unresolved", "its .ctl was not found at %s"
+                                            % link_target_text(path, self.file_path)))
+            return None
+        if not newer_than(f, self.file_path):
+            LINK_STATS["skippedByDate"].add(os.path.normcase(f))
+            return None          # saved before this file: its copy here is the current one
+        LINK_STATS["read"].add(os.path.normcase(f))
+        disk, nested, why = _ctl_typedef(f, self.chain)
+        for k, v in nested.items():
+            # a nested typedef the .ctl could not resolve leaves that part of the type unverified;
+            # one it resolved is current here whatever the .ctl's own copy says
+            if v[0] == "unresolved":
+                self.findings.setdefault(k, v)
+        inner = _wrapped(disk) if disk is not None else None
+        if inner is None:
+            self.findings.setdefault(name, ("unresolved", "its .ctl could not be read: %s (%s)" % (f, why)))
+            return None
+        own = _wrapped(snap)
+        if own is not None and _type_shape(own) == _type_shape(inner):
+            return None          # the copy is current: keep it exactly as embedded
+        self.findings.setdefault(name, ("drift", "the copy this file embeds differs from what %s "
+                                        "defines now, its own linked typedefs included; that "
+                                        "definition is used, as LabVIEW does on load" % f))
+        out = ET.Element("TypeDesc", dict(snap.attrib))
+        fresh = copy.deepcopy(inner)
+        for k in ("Label", "HasLabel"):
+            # the INSTANCE's label lives on the wrapped type and stays the caller's
+            if own is not None and own.get(k) is not None:
+                fresh.set(k, own.get(k))
+            elif k in fresh.attrib:
+                del fresh.attrib[k]
+        out.append(fresh)
+        for c in snap:
+            if c.tag != "TypeDesc":
+                out.append(copy.deepcopy(c))
+        return out
+
+
+def label_text(ddo):
+    parts = ddo.find("partsList")
+    for part in (parts if parts is not None else []):
+        if part.get("class") == "label" and part.findtext("partID") == "16":
+            t = part.findtext("textRec/text")
+            if t and len(t) > 1 and t.startswith('"') and t.endswith('"'):
+                t = t[1:-1]          # raw inside the quotes - pylabview escapes nothing
+            # pylabview writes an unquoted [NULL] for a label with no text at all, and a NUL
+            # BYTE as the literal text `&#x00;` - NI's export of DW Test Change Info.vi has an
+            # empty label there
+            # in CP1252, as LabVIEW wrote it (lvheap.pylv_to_text) - `Code Größe` came back as
+            # `Code Grˆﬂe` until 2026-11-19
+            return "" if t in (None, "[NULL]") else lvheap.pylv_to_text(t.replace("&#x00;", ""))
+    return ""
+
+
+INT_MIN, INT_MAX = -2 ** 31, 2 ** 31 - 1
+# the reader's own names for a structure's non-AIXML terminals - a real terminal name may start
+# with '#' too (`# of Refs`, `# of taps`: 35 Call terminals over NI's examples were dropped as
+# internal until 2026-11-06)
+# the LVSR Execution attributes carried after </VI> (`exec`) and set back by the composer
+EXEC_KEPT = ("IsReentrant", "PooledReentrancy", "IsSubroutine", "Priority", "PrefExecSyst", "SaveParallel")
+INTERNAL_TERMS = {"#cond", "#count", "#maxin", "#maxout", "#selectin", "#selectout", "#timeoutin"}
+IGNORED, MISSING = object(), object()     # term_owner sentinels: an end AIXML has no terminal for
+
+
+def sublabel_text(diag):
+    """A subdiagram's LABEL (Visible Items > Subdiagram Label): a `label` of partID 8024 in the
+    diagram's own zPlaneList. None when the diagram shows none - NI writes `label=""` only for a
+    label that is visible and empty."""
+    z = diag.find("zPlaneList") if diag is not None else None
+    for o in (z if z is not None else []):
+        if o.get("class") == "label" and o.findtext("partID") == "8024":
+            t = o.findtext("textRec/text")
+            if t and len(t) > 1 and t.startswith('"') and t.endswith('"'):
+                t = t[1:-1]
+            return "" if t in (None, "[NULL]") else lvheap.pylv_to_text(t.replace("&#x00;", ""))
+    return None
+
+
+def set_sublabel(el, diag):
+    """`label=` as NI's exporter writes it: , : \\ and control characters as \\XX."""
+    t = sublabel_text(diag)
+    if t is not None:
+        el.set("label", "".join("\\%02X" % ord(c) if c in ",:\\" or ord(c) < 0x20 else c for c in t))
+
+
+def name_attr(s):
+    """A label as a `_name` attribute, as NI's exporter writes one: a backslash DOUBLED - it writes
+    `delimiter (\\\\t)` for the label `delimiter (\\t)` - so the composer's unescape cannot read a
+    backslash and two hex digits that follow it as one character. And ':' and ',' as \\3A and \\2C:
+    counted 2026-10-15 over 869 cached NI exports, 85 of 85 control and indicator names holding a
+    colon carry \\3A and 23 of 23 holding a comma carry \\2C. Raw, JKI's `attribute? (F: entity)`
+    reached lvai_vi_terminals as a name no `inputs=` string can carry, ':' being its separator."""
+    return s.replace("\\", "\\\\").replace(":", "\\3A").replace(",", "\\2C")
+
+
+_LABEL_ESCAPES = {"\\\\": "\\", "\\3A": ":", "\\2C": ","}
+
+
+def label_of(name):
+    """The label behind a `_name` written by name_attr - for the places that hand a control's name
+    on as something else: a terminal name (escaped again by `escape`), a `link=` (NI writes it RAW,
+    `link="PV:"`) or an event selector (escaped by its own rule). Measured as a regression the day
+    name_attr learned \\3A: a VI Server Reference's output came out `SP\\5C3A`."""
+    return re.sub(r"\\\\|\\3A|\\2C", lambda m: _LABEL_ESCAPES[m.group(0)], name)
+
+
+def unquote(t):
+    """A heap string's text: RAW between its quotes - pylabview escapes nothing inside them."""
+    if t and len(t) > 1 and t.startswith('"') and t.endswith('"'):
+        return t[1:-1]
+    return t or ""
+
+
+def heap_text(t):
+    """A heap string as LabVIEW wrote it: unquoted, a byte pylabview could not print (`&#xNN;`, a
+    CR or NUL) decoded, and the MacRoman pylabview rendered turned back into the CP1252 LabVIEW on
+    Windows wrote (the rule the diagram comments established, 2026-10-21). "" for none."""
+    if t in (None, "[NULL]"):
+        return ""
+    text = re.sub(r"&#x([0-9A-Fa-f]{2});", lambda m: chr(int(m.group(1), 16)), unquote(t))
+    try:
+        return text.encode("mac_roman").decode("cp1252")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return text
+
+
+def esc_attr_items(items):
+    """Case selector items as NI writes them: joined by ', ' with the comma escaped."""
+    return "\\2C ".join(items)
+
+
+def esc_case_text(s):
+    """A string or enum case item's TEXT as NI writes it inside the quotes: ',' as \\2C - NI's own
+    `"N-waveforms\\2C N-filters"`, which unescaped raw would split into two items - control
+    characters as \\XX, and a backslash DOUBLED so aixml2vi.unescape cannot read what follows it as
+    hex. A raw control character is not legal XML 1.0 at all: the LabVIEW Icon Editor's KeyDown.vi
+    has a Backspace case `"\\x08"`, and the export was unreadable from that byte on (2026-10-15)."""
+    return "".join("\\\\" if c == "\\" else ("\\%02X" % ord(c) if ord(c) < 0x20 or c == "," else c) for c in s)
+
+
+# what XML 1.0 forbids outright; \t \n \r are legal and ElementTree writes them as references
+_XML_ILLEGAL = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def escape_illegal_xml_chars(root):
+    """The last line of defence before serialising: an attribute or text holding a character XML
+    1.0 forbids makes the WHOLE export unparseable, so it is written as \\XX - AIXML's own escape -
+    and a comment names each place, because a path that reaches here was not escaped on purpose."""
+    hits = []
+    for el in root.iter():
+        for k, v in list(el.attrib.items()):
+            if _XML_ILLEGAL.search(v):
+                el.set(k, _XML_ILLEGAL.sub(lambda m: "\\%02X" % ord(m.group()), v))
+                hits.append("%s %s=" % (el.tag, k) + (" uid %s" % el.get("uid") if el.get("uid") else ""))
+        if el.text and _XML_ILLEGAL.search(el.text):
+            el.text = _XML_ILLEGAL.sub(lambda m: "\\%02X" % ord(m.group()), el.text)
+            hits.append("%s text" % el.tag)
+    for h in hits:
+        root.append(ET.Comment(" vi2aixml: control character written as \\XX in %s " % h))
+    return hits
+
+
+# XNodes read as the code they generated (xnode_inline) - on by default; LABVIEWMCP_INLINE_XNODES=0
+# writes NI's form, a Call of the .xnode, which the composer refuses. XNodes lvai_generate_vi puts
+# in place itself through {LV.SubVI} Replace (XNodeCalls.cs) keep that Call
+INLINE_XNODES = os.environ.get("LABVIEWMCP_INLINE_XNODES", "1").strip() not in ("0", "false", "off", "no")
+XNODE_REPLACE_ROUTES = {"Match Regular Expression.xnode"}
+
+# heap class of a fixed-shape node -> its AIXML name; the terminal names come from the
+# composer's template parts (parts/tnode__*.xml), which name every terminal (harvest_templates.py)
+TEMPLATE_CLASSES = {"aDelete": "Delete From Array", "aInit": "Initialize Array", "aInsert": "Insert Into Array",
+                    "aReplace": "Replace Array Subset", "aReshape": "Reshape Array",
+                    "cABuild": "Index & Bundle Cluster Array", "concat": "Concatenate Strings",
+                    "cpdArith": "Compound Arithmetic", "interLeave": "Interleave 1D Arrays",
+                    "mergeErrors": "Merge Errors", "printf": "Format Into String", "scanf": "Scan From String",
+                    "subset": "Array Subset"}
+NODE_READERS = {"nMux": "nmux", "mux": "mux", "demux": "demux", "aIndx": "aindx", "aBuild": "abuild",
+                "propNode": "propnode", "invokeNode": "invokenode", "eventDataNode": "eventdata",
+                "statVIRef": "statvi", "ctlRefConst": "ctlref", "gRef": "gref", "hiddenFBNode": "feedback",
+                "eventRegNode": "eventreg",
+                "exprNode": "expr", "fBox": "fbox",
+                "callByRefNode": "callbyref", "scriptNode": "scriptnode",
+                "decimate": "decimate", "xNode": "xnode", "extFunc": "extfunc", "Class0183": "pythonnode",
+                "Class0193": "matlabnode", "mergeSignal": "mergesignals",
+                "sharedVariable": "sharedvariable", "constructorNode": "constructornode",
+                "eventRegCallback": "eventregcallback", "Class018B": "buildmap",
+                "xDataNode": "xdatanode"}
+CA_OPS ={0: "Add", 1: "Multiply", 2: "AND", 3: "OR", 4: "XOR"}
+# a bDFixed constant's `cnst` code -> its AIXML FixedConst name (the composer's own table, reversed)
+FIXED_BY_CODE = {v.upper(): k for k, v in aixml2vi.Composer.FIXED.items()}
+WAVEFORM_FIELDS = ["t0", "dt", "Y", "error", "attributes"]
+_TEMPLATES = None
+
+
+def template_names(cls):
+    """Every template of a node class as its list of terminal names, by term position."""
+    global _TEMPLATES
+    if _TEMPLATES is None:
+        import glob
+        _TEMPLATES = {}
+        for f in glob.glob(os.path.join(aixml2vi.OWN_PARTS, "tnode__*.xml")):
+            try:
+                node = ET.parse(f).getroot().find("heap")[0]
+            except Exception:
+                continue
+            _TEMPLATES.setdefault(node.get("class"), []).append(
+                [(t.get("aixml") or "?", bool(int(t.findtext("objFlags") or 0) & SINK)) for t in node.find("termList")])
+    return [[nm for nm, _ in t] for t in _TEMPLATES.get(cls, [])]
+
+
+def sinks_for(cls, n):
+    """Which of a template node's `n` terminals are INPUTS, chosen as names_for chooses its names.
+    The parts are wired, so every input there carries SINK; an unwired input of the VI being read
+    carries nothing, and Scan From String's outputs do not set bit 0 on their DCO either - so the
+    template is the only place that says which way an unwired terminal points (2026-11-06)."""
+    template_names(cls)
+    ts = _TEMPLATES.get(cls, [])
+    exact = [t for t in ts if len(t) == n]
+    if exact:
+        return [s for _, s in exact[0]]
+    if not ts:
+        return None
+    t = [s for _, s in max(ts, key=len)]
+    while len(t) < n:
+        t.append(t[-1])
+    return t[:n]
+
+
+def names_for(cls, n):
+    """Terminal names for a node of class `cls` with `n` terminals: a template of exactly that
+    size, else the longest one extended - a trailing `input N` counts on, anything else repeats."""
+    import re as _re
+    ts = template_names(cls)
+    exact = [t for t in ts if len(t) == n]
+    if exact:
+        return exact[0]
+    if not ts:
+        return None
+    t = list(max(ts, key=len))
+    while len(t) < n:
+        m = _re.fullmatch(r"(.*?)(\d+)", t[-1])
+        t.append("%s%d" % (m.group(1), int(m.group(2)) + 1) if m else t[-1])
+    return t[:n]
+
+
+class _Owners(dict):
+    """term uid -> (element, terminal name, is sink), remembering the order terminals were
+    registered in - which is their termList order, the order a node's repeated terminal names
+    (element, value, string) are matched in by the composer."""
+    def __init__(self):
+        super().__init__()
+        self.order = []
+
+    def __setitem__(self, k, v):
+        super().__setitem__(k, v)
+        self.order.append(k)
+
+
+class Reader:
+    """Heap -> AIXML. uids follow LabVIEW's own export (uid_survey.py over 200 exports): a
+    control/constant is its ddo, a node its own uid, a Structure the structure node, a CaseFrame
+    the frame's diag, a Tunnel the OUTER terminal (a case frame's half: the frame's inner
+    terminal), a Condition the lTst DCO, a ShiftReg the rSR DCO, its Left the lSR DCO and its
+    Right the rSR's inner terminal, a Call the iUse node."""
+
+    def __init__(self, main_xml, vi_path=None):
+        self.b = lvheap.Bundle(main_xml, collections=True)
+        # the VI's own file: a callee linked RELATIVE to it is found from here, to name a call's
+        # terminals its link carries no labels for
+        self.vi_path = vi_path
+        self.call_paths = {}
+        _, self.term_names = aixml2vi.load_names()
+        self.prim_name = {}
+        import csv, html
+        with open(os.path.join(aixml2vi.TABLES, "primitive-names.tsv"), encoding="utf-8") as f:
+            for row in csv.reader((l for l in f if not l.startswith("#")), delimiter="\t"):
+                if row and row[0] != "primResID":
+                    self.prim_name[row[0]] = html.unescape(row[1])
+        extra = os.path.join(os.path.dirname(os.path.abspath(__file__)), "primitive-names-extra.tsv")
+        if os.path.exists(extra):
+            for row in aixml2vi._tsv(extra):
+                self.prim_name.setdefault(row[0], aixml2vi.unescape(html.unescape(row[1])))
+        self.out = ET.Element("VI")
+        self.term_owner = _Owners()    # heap term uid -> (aixml element, terminal name, is_sink)
+        self.notes = []
+        # the libraries the VI itself belongs to (LIBN), outermost first: a link record saved
+        # RELATIVE to them (LinkSaveFlag 2) names its target without them
+        self.caller_libs = [l.text.strip() for l in self.b.main.findall("LIBN/Section/Library") if (l.text or "").strip()]
+        # linked typedefs as their .ctl files define them NOW, not as this file's copy (issue
+        # #136); only with the file itself - a bundle read alone has no place to resolve from
+        self.typedef_links = TypedefLinks(self.b, vi_path, self.caller_libs) if vi_path else None
+        self.b.typedef_resolver = self.typedef_links
+        self.call_targets = self._call_targets()
+        # subVI calls whose callee's pane changed on disk since this file was saved (issue #136's
+        # sibling): {call uid: (target, drift | unresolved, [details])}
+        self.subvi_findings = {}
+        if vi_path:
+            read_files_at_once(sorted({f for f in (self._checked_callee(p) for p in self.call_paths.values())
+                                       if f and newer_than(f, vi_path) and _file_key(f) not in _CALLEE_PANES}),
+                               callee_pane)
+        self.instance_names = self._express_instances()
+        self.prop_items = {}     # property node uid -> its items' code paths, in field order
+        self.diags = []         # every diagram walked, for wiring
+        self.attachments = None  # comment attachment objects by uid (comments())
+        self.anchored = {}       # anchored comments: object uid -> text, set as comment= in read()
+        self.ordered_inputs = {}   # element -> its inputs in TERMINAL order, unwired ones listed
+        self.ordered_ports = []    # (element, attr, [(term uid, name)]) rewritten after wiring
+        self.term_net = {}
+
+    # ---- helpers ---------------------------------------------------------------------------
+    def typedef_findings(self):
+        """{qualified typedef name: (drift | unresolved, detail)} over every type read so far."""
+        return dict(self.typedef_links.findings) if self.typedef_links is not None else {}
+
+    def tid_tree(self, el, snapshot=False):
+        """The type of a heap object; `snapshot` as the file embeds it, which is what its saved
+        DATA is flattened against, else with linked typedefs as their .ctl files define them."""
+        e = lvheap.typeid_elements(el)
+        if not e:
+            return None
+        return self.b.heap_type_tree(int(lvheap.TYPEID_RE.fullmatch(e[0].text.strip()).group(1)), snapshot)
+
+    def stored_value(self, tree, snap, hexstr, what):
+        """A saved value, decoded against the type it was SAVED with. Where a linked typedef's
+        .ctl changed that type, LabVIEW MUTATES the value on load, keeping each cluster field BY
+        NAME and giving a new one its default: NI's export of Issue136's Caller.vi wrote
+        `[[1.5,0],7]` for the constant saved as `[[1.5],7]` once Inner gained B (2026-11-18).
+        `mutate_value` does the same; what it cannot carry over is the new type's empty value,
+        with a note."""
+        if snap is None or aixml_type(snap) == aixml_type(tree):
+            return decode_value(snap if snap is not None else tree, hexstr)
+        try:
+            v = mutate_value(snap, tree, bytes.fromhex(hexstr) if hexstr else b"", 0)[0]
+        except (ValueError, IndexError, struct.error):
+            v = None
+        if v is not None:
+            self.notes.append("%s: its saved value was carried into the changed typedef as LabVIEW "
+                              "does on load (see the typedef notes)" % what)
+            return v
+        self.notes.append("%s: its saved value belongs to an older version of a linked typedef "
+                          "(see the typedef notes) - written as the new type's empty value" % what)
+        return empty_value(tree)
+
+    def _call_targets(self):
+        """node uid -> {link record tag: qualified name} from the diagram's link records: IUVI
+        names the VI a call node runs, PUPV the polymorphic VI it was dropped as. A record whose
+        qualified name is the bare VI name but whose VILSPathRef names a library gets the
+        library in front, as NI's export writes it (LV AI Plugins.lvlib:...)."""
+        out = {}
+        sec = self.b.main.find("LIbd/Section")
+        if sec is not None and sec.get("Format") == "bin" and sec.get("File"):
+            # pylabview leaves the block BINARY when one record is of a kind it cannot parse -
+            # a call into a CLASS (LUnit's Test Case.lvclass:Pass If.vi) was "?" for that
+            data = open(os.path.join(self.b.dir, sec.get("File")), "rb").read()
+            for off, tag, name, flag, path in binary_link_records(data):
+                name = ":".join(self._relative_to_caller(name.split(":"), str(flag)))
+                out.setdefault(str(off), {})[tag] = name
+                if path and (tag == "IUVI" or str(off) not in self.call_paths):
+                    self.call_paths[str(off)] = path
+            return self._channel_templates(out)
+        bdhp = self.b.main.find("LIbd/Section/BDHP")
+        for rec in (bdhp if bdhp is not None else []):
+            # a DyOM's method name is a NESTED qualified name, which pylabview writes as literal
+            # text (`&#x01;&#x0E;Write Width.vi`) - decoded and expanded as in the binary path
+            qual = [x for s in rec.findall("LinkSaveQualName/String")
+                    for x in _nested_text(s.text or "")]
+            if not qual:
+                continue
+            lib = [x.text or "" for x in rec.findall("VILSPathRef/String")]
+            if len(qual) == 1 and lib and lib[-1].lower().endswith((".lvlib", ".lvclass", ".xctl", ".lvlibp")):
+                qual = [lib[-1]] + qual
+            else:
+                qual = self._relative_to_caller(qual, rec.get("LinkSaveFlag"))
+            name = ":".join(qual)
+            pref = rec.find("LinkSavePathRef")
+            path = (int(pref.get("TpVal") or 0), [s.text or "" for s in pref.findall("String")]) if pref is not None else None
+            # a class link record (DyOM, FPPI, DDPI) keeps its uids in APILinkCacheList - read
+            # once pylabview parses the link cache's tail (patches.json, class-link-tail)
+            for off in rec.findall("LinkOffsetList/Offset") + rec.findall("APILinkCacheList/Offset"):
+                try:
+                    k = str(int(off.text, 16))
+                except (TypeError, ValueError):
+                    continue
+                out.setdefault(k, {})[rec.tag] = name
+                if path and (rec.tag == "IUVI" or k not in self.call_paths):
+                    self.call_paths[k] = path
+        return self._channel_templates(out)
+
+    def _channel_templates(self, out):
+        r"""A CHANNEL wire's call runs a generated instance library - `<extravilib>\ChannelInstances
+        \Stream-i32\Read.vi`, `Messenger-class'MyMessage'.lvlib` - and NI's export names the
+        TEMPLATE it was made from, `Stream.lvlib:Read.vi`: about 400 calls over NI's shipping
+        examples (2026-11-06). The template's name is the instance's up to its first `-`."""
+        for k, recs in out.items():
+            path = self.call_paths.get(k)
+            if not path or "ChannelInstances" not in path[1]:
+                continue
+            for tag, name in recs.items():
+                parts = name.split(":")
+                # only a call straight into the library: a CLASS inside the instance keeps the
+                # instance's name in NI's export, `High Speed Stream-i32.lvlib:Abort
+                # Signal.lvclass:Abort.vi` (3 of 3)
+                if len(parts) == 2 and parts[0].lower().endswith(".lvlib") and "-" in parts[0]:
+                    parts[0] = parts[0].split("-", 1)[0] + ".lvlib"
+                    recs[tag] = ":".join(parts)
+        return out
+
+    def _relative_to_caller(self, qual, flag):
+        """A link record's qualified name, completed by the caller's own libraries (LIBN) where
+        its LinkSaveFlag says it was saved RELATIVE to them:
+        2 - to the caller's whole library chain: Caraya's Run Tests.vi calls `Run Test
+            (Object).vi`, NI exports `Caraya.lvlib:Run Test (Object).vi`; Pry.vi in Lever.lvclass
+            calls `Multiply Force.vi`, NI exports `Lever.lvclass:Multiply Force.vi`;
+        3 - to its OUTERMOST library only: Send Normal Stop.vi (Actor Framework.lvlib, Stop
+            Msg.lvclass) calls `Message Enqueuer.lvclass:Enqueue.vi`, NI exports `Actor
+            Framework.lvlib:Message Enqueuer.lvclass:Enqueue.vi` - Message Maker's the same.
+        The flag is per record: Pry.vi's calls into vi.lib carry 0. A NESTED library or class of
+        the caller's chain: DQMH's Close Module.vi (in Device Under Test_Cloneable_DQMH.lvlib)
+        calls `Clone Registration.lvlib:Remove.vi`, NI exports `Device Under
+        Test_Cloneable_DQMH.lvlib:Clone Registration.lvlib:Remove.vi` (2026-11-06). A name that
+        already starts INSIDE the chain is completed only above it."""
+        return qualify_link(qual, flag, self.caller_libs)
+
+    def _express_instances(self):
+        """Instance name (`1`, a GUID) -> the name NI's export gives its call. The VI's VINS
+        block: section 0 is an index - a uint32 count, then each instance's name as a Pascal
+        string padded with zeros - and section k+1 holds instance k, an embedded VI of its own.
+        - An EXPRESS VI's instance holds the path of the template it was made from, followed by
+          `Localized`: `<vilib>\\express\\...\\SampleCompressionBlock.llb\\Ex_Inst_Sample
+          Compression.vi`, `...\\FileDialogBlock.llb\\File Dialog Source.vi` - and NI names the
+          call after that file (Express VI - Sample Compression.vi, Manage DataPlugins.vi).
+        - A MALLEABLE VI's instance links to its .vim FIRST among its VI-level links (LIvi) -
+          `Pass If Equal.vim` before the `Compare Variants.vim` its diagram calls in turn, which
+          only its LIbd names - and NI names the call after the .vim."""
+        secs = {int(s.get("Index") or 0): s.get("File") for s in self.b.main.findall("VINS/Section")
+                if s.get("Format") == "bin" and s.get("File")}
+        if 0 not in secs:
+            return {}
+        idx = open(os.path.join(self.b.dir, secs[0]), "rb").read()
+        count = int.from_bytes(idx[:4], "big")
+        names, pos = [], 4
+        for _ in range(count):
+            while pos < len(idx) and idx[pos] == 0:
+                pos += 1
+            if pos >= len(idx):
+                break
+            ln = idx[pos]
+            names.append(idx[pos + 1:pos + 1 + ln].decode("mac_roman", "replace"))
+            pos += 1 + ln
+        out = {}
+        for k, nm in enumerate(names):
+            f = secs.get(k + 1)
+            if not f:
+                continue
+            data = open(os.path.join(self.b.dir, f), "rb").read()
+            m = re.search(rb"Ex_Inst_[^\x00-\x1f]{1,120}?\.vi", data)
+            if m:
+                out[nm] = m.group(0).decode("mac_roman", "replace")
+                continue
+            # else the template path, then seven zero bytes and a Pascal string: `Localized` after
+            # most (File Dialog Source.vi), `NI.LV.AL...` after Dual Channel Spectral Measurement
+            # Source.vi, `_Conversion` after Collector's DDT to 1D Dbl Automatic.vi - tried in that
+            # order of certainty - and never the express VI's `Configure <X>.vi` dialog, whose path
+            # stands earlier in some instances
+            found = None
+            for after in (rb"\tLocalized", rb"[\x01-\x40][A-Za-z]", rb"[\x01-\x40]_"):
+                for m in re.finditer(rb"([^\x00-\x1f][^\x00]{0,120}?\.vi)\x00{7}" + after, data):
+                    # the path's last component, a Pascal string: its length byte precedes it
+                    tail = m.group(1)
+                    for i in range(len(tail) - 4, -1, -1):
+                        if m.start(1) + i > 0 and data[m.start(1) + i - 1] == len(tail) - i:
+                            name = tail[i:].decode("mac_roman", "replace")
+                            if not name.startswith("Configure "):
+                                found = name
+                            break
+                    if found:
+                        break
+                if found:
+                    break
+            if found:
+                out[nm] = found
+                continue
+            vim = self._malleable_source(data)
+            if vim:
+                out[nm] = vim
+        return out
+
+    @staticmethod
+    def _malleable_source(data):
+        """The qualified name of the .vim a malleable instance was made from: the first
+        qualified name ending in .vim among the embedded VI's VI-level links (LIvi)."""
+        tmp = tempfile.mkdtemp(prefix="vins_")
+        try:
+            p = os.path.join(tmp, "i.vi")
+            with open(p, "wb") as fh:
+                fh.write(data)
+            try:
+                b = lvheap.Bundle(lvheap.extract(p, tmp))
+            except Exception:
+                return None
+            sec = b.main.find("LIvi/Section")
+            if sec is None:
+                return None
+            if sec.get("Format") != "bin":
+                for rec in sec.iter():
+                    q = [x for s in rec.findall("LinkSaveQualName/String") for x in _nested_text(s.text or "")]
+                    if q and q[-1].lower().endswith(".vim"):
+                        return ":".join(q)
+                return None
+            raw = open(os.path.join(b.dir, sec.get("File")), "rb").read()
+            for s in range(2, len(raw) - 4):
+                n = int.from_bytes(raw[s - 2:s], "big")
+                if not 1 <= n <= 4:
+                    continue
+                cand, end = _pascal_names(raw, s, n)
+                if cand and cand[-1].lower().endswith(b".vim") and 0 <= raw.find(b"PTH0", end) - end <= 8:
+                    return ":".join(x.decode("mac_roman", "replace") for nm_ in cand for x in _expand_nested(nm_))
+            return None
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    @staticmethod
+    def _tunnel_ranks(node, dco_class):
+        """term uid -> its tunnel number as NI's export counts it: inputs and outputs separately,
+        in the order their INNER halves stand in the FIRST frame's sRN term list - not the order
+        of the structure's own term list, and not their position. MGI's Read Number of
+        children.vi lists the outer tunnels 164, 176, 348 (tops 203, 31, 116) and NI numbers them
+        Out2, Out1, Out3: frame 0's sRN lists their halves 174 (176's), 162 (164's), 340 (348's).
+        Empty when that list cannot be read; the caller then keeps the heap order."""
+        dl = node.find("diagramList")
+        if dl is None or not len(dl):
+            return {}
+        # the frame's OWN sRN - a nested structure's comes first in document order sometimes
+        srn = next((n for n in Reader.node_defs(dl[0]) if n.get("class") == "sRN"), None)
+        if srn is None or srn.find("termList") is None:
+            return {}
+        pos, by_dco = {}, {}
+        for i, t in enumerate(srn.find("termList")):
+            pos[t.get("uid")] = i
+            if t.find("dco") is not None:
+                # a half may name its tunnel's DCO instead of being listed by it (commentTun)
+                by_dco.setdefault(t.find("dco").get("uid"), i)
+        tuns = []
+        for term in node.find("termList") if node.find("termList") is not None else []:
+            d = term.find("dco")
+            if d is None or d.get("class") != dco_class:
+                continue
+            halves = [pos[x.get("uid")] for x in (d.find("termList") if d.find("termList") is not None else [])
+                      if x.get("uid") in pos]
+            if d.get("uid") in by_dco:
+                halves.append(by_dco[d.get("uid")])
+            if not halves:
+                return {}
+            tuns.append((int(d.findtext("objFlags") or 0) & 1, min(halves), term.get("uid")))
+        ranks = {}
+        for out in (0, 1):
+            for n, t in enumerate(sorted(x for x in tuns if x[0] == out), 1):
+                ranks[t[2]] = n
+        return ranks
+
+    def dco_def(self, d):
+        """A DCO as its DEFINITION. A term's <dco> is often a bare `<dco uid="402"/>` whose class
+        and body live elsewhere in the heap - a shift register's rSR, for one, is defined NESTED in
+        its lSR (`<dco class="lSR"> ... <rsrDCO class="rSR" uid="402">`), so the loop's own term for
+        it carries no class. Read as classless, 53 of 58 missing shift registers in the cached NI
+        exports went missing that way (2026-10-15)."""
+        if d is None or d.get("class"):
+            return d
+        if getattr(self, "_dco_index", None) is None:
+            self._dco_index = {}
+            for e in self.b.bd.iter():
+                if e.get("class") and e.get("uid"):
+                    self._dco_index.setdefault(e.get("uid"), e)
+        return self._dco_index.get(d.get("uid"), d)
+
+    @staticmethod
+    def node_defs(diag):
+        """The nodes of a diagram, in nodeList order, each resolved to its DEFINITION (often in
+        zPlaneList, referenced from nodeList by a bare uid)."""
+        defs = {}
+        for lst in ("zPlaneList", "nodeList"):
+            for e in (diag.find(lst) if diag.find(lst) is not None else []):
+                if e.get("class"):
+                    defs[e.get("uid")] = e
+        out = []
+        for ref in (diag.find("nodeList") if diag.find("nodeList") is not None else []):
+            n = ref if ref.get("class") else defs.get(ref.get("uid"))
+            if n is not None:
+                out.append(n)
+        # a Flat Sequence is defined in the z list only - the nodeList names its FRAMES, which
+        # are defined inside it - so it is picked up from the z list
+        seen = {id(n) for n in out}
+        for e in (diag.find("zPlaneList") if diag.find("zPlaneList") is not None else []):
+            if e.get("class") == "flatSequence" and id(e) not in seen:
+                out.append(e)
+        return out
+
+    # ---- the whole VI ------------------------------------------------------------------------
+    def _note_classes(self, el, tree):
+        """Remember which classes `el`'s ref{UDClassInst}s are, for main() to write after </VI>."""
+        names = class_names(tree)
+        if names:
+            self.class_refs = getattr(self, "class_refs", [])
+            self.class_refs.append((el, names))
+        items = xctl_items(tree)
+        if any(items):
+            self.xctl_refs = getattr(self, "xctl_refs", [])
+            self.xctl_refs.append((el, items))
+
+    def read(self):
+        b = self.b
+        # LabVIEW loads a file under its FILE name, and so names it NI's export: a class's private
+        # data control saved as pdc.ctl still says Channel.ctl inside (2026-10-14). The stored
+        # name stays where the two differ only in CASE - a caller may spell the path in any case
+        # on Windows (`test Skipped.vi` for Test Skipped.vi, which NI's export kept)
+        name = b.main.find("LVSR/Section").get("Name")
+        if self.vi_path and os.path.basename(self.vi_path).lower() != (name or "").lower():
+            name = os.path.basename(self.vi_path)
+        # a library member's name is QUALIFIED, as NI's exporter writes it - "X.xctl:Facade.vi",
+        # "Special Monitor.lvclass:Monitor Data Changed.vi" - the owning library from LIBN
+        libs = [l.text.strip() for l in b.main.findall("LIBN/Section/Library") if (l.text or "").strip()]
+        self.out.set("_name", ":".join(libs + [name]))
+        try:
+            self.pane_id = int(b.fp.findtext("root/conPane/conId"))
+        except (TypeError, ValueError):
+            self.pane_id = None
+        # and the pane's slot FLAGS, which `connection` only partly carries: dynamic dispatch
+        # (0x8000, NI's class members write 0x9000) and an output's in-place partner (0x0400
+        # plus the partner slot - error out 0x0D04 beside error in at 4)
+        self.pane_slot_flags = {}
+        try:
+            func = b.flat[b.flat_of_consolidated(int(b.main.find("CONP/Section/TypeDesc").get("TypeID")))]
+            if func.get("Type") == "Function":
+                for i, c in enumerate([c for c in func if c.tag == "TypeDesc"]):
+                    f = int(c.get("Flags") or "0", 16)
+                    if c.get("TypeID") is not None and f:
+                        self.pane_slot_flags[i] = f
+        except (TypeError, ValueError, AttributeError, IndexError):
+            pass
+        self.out.set("description", escape_description(self.description_text()))
+        pane = self.pane_flags()
+        self.fp_by_uid = {}
+        for fpdco in b.fp.iter("SL__arrayElement"):
+            if fpdco.get("class") != "fPDCO":
+                continue
+            ddo = fpdco.find("ddo")
+            ind = int(fpdco.findtext("objFlags") or 0) & 1
+            tree = self.tid_tree(fpdco)
+            t = aixml_type(tree)
+            el = ET.Element("Indicator" if ind else "Control", {"_name": name_attr(label_text(ddo))})
+            if int(fpdco.findtext("objFlags") or 0) & 0x1000 and t and "UDClassInst" in t:
+                # a DYNAMIC DISPATCH terminal (fPDCO objFlags 0x1000) - AIXML writes a dynamic
+                # OUTPUT `recommended`, so the composer learns it from the trailer
+                self.dynamic_fp = getattr(self, "dynamic_fp", [])
+                self.dynamic_fp.append(el)
+            if t is None:
+                el.set("type", "?" + (lvheap.type_key(tree) or ""))
+                self.notes.append("front-panel %s %r: type %s not mapped" % (ddo.get("class"), label_text(ddo), lvheap.type_key(tree)))
+            else:
+                el.set("type", t)
+                self._note_classes(el, tree)
+            # the control's own DESCRIPTION, as NI's export writes it on Control and Indicator -
+            # 1 994 of them over NI's 1 784 shipping examples, the reader none until 2026-11-06.
+            # It sits on the ddo as a cLStrObj (`<description><strings><SL__arrayElement>"..."`),
+            # escaped like the VI's own
+            raw = ddo.findtext("description/strings/SL__arrayElement")
+            if raw is None and ddo.get("class") == "typeDef":
+                # a TYPEDEF'd control keeps it on the control inside (DQMH's semaphore refnum)
+                raw = next((p.findtext("description/strings/SL__arrayElement")
+                            for p in (ddo.find("partsList") if ddo.find("partsList") is not None else [])
+                            if p.find("description") is not None), None)
+            # NI's export drops the TRAILING blanks and line breaks LabVIEW keeps (551 of 551
+            # differences over NI's shipping examples were only that)
+            text = heap_text(raw).rstrip(" \t\r\n")
+            if text:
+                el.set("description", escape_description(text))
+            # style, as NI's exports write it: latched (a boolean's mechanical action, ddo
+            # objFlags 0x20000 - NI's Stop buttons carry 0x60000), Ring (a stdRing on a plain
+            # number, items from its multiLabel buf) and Table (a tableControl)
+            cls = ddo.get("class")
+            ring = ddo
+            if cls == "typeDef":
+                # a TYPEDEF'd ring is a typeDef object whose parts hold the stdRing: its items
+                # are the ring's (ex_createStringTable.vi's `Source`, Terminal/Ignore/Value),
+                # and without them a `Strings []` node on it was `Invalid property`, 2026-10-23
+                ring = next((p for p in (ddo.find("partsList") if ddo.find("partsList") is not None else [])
+                             if p.get("class") == "stdRing"), None)
+                cls = "stdRing" if ring is not None else cls
+            if cls == "stdBool" and not ind and int(ddo.findtext("objFlags") or 0) & 0x20000:
+                el.set("style", "latched")
+            elif cls == "stdRing" and t is not None and "{" not in t:
+                self._ring(el, ring, t)
+            elif cls == "tableControl":
+                el.set("style", "Table")
+            elif cls == "stdComboBox":
+                # a COMBO BOX: NI's export writes a plain string and loses the items; the style
+                # and items keep it a combo box through a round trip (aixml2vi._set_combo_box,
+                # 2026-11-19). Its own values (Values Match Items off) are not read
+                self._combo_box(el, ddo)
+            elif cls == "plugInDDO" and bytes.fromhex(ddo.findtext("className") or "").startswith(b"ImageControl"):
+                # NI Vision's IMAGE DISPLAY (a plug-in object of nivision.dll): NI's export writes
+                # it as a plain IMAQ Image refnum; the style keeps it an Image Display through a
+                # round trip, where lvai_generate_vi places NI's .ctl (2026-11-17). Which of NI's
+                # three looks (plain, Classic, Silver) is not read - it comes back as the plain one
+                el.set("style", "Image Display")
+            elif cls == "xControl":
+                # an XCONTROL INSTANCE: NI's export writes it as a plain control of its data type;
+                # which .xctl it is goes after </VI> (`xcontrol`), read off the panel's XCXI link
+                self.xcontrol_fp = getattr(self, "xcontrol_fp", [])
+                self.xcontrol_fp.append((el, ddo.get("uid")))
+            elif cls in ("listbox", "mcListbox", "scenegraphdisplay") + aixml2vi.FPCLASS_PLAIN_DATA:
+                # a LISTBOX is an int32 in AIXML too, a 3D PICTURE CONTROL a plain scene refnum; the
+                # object class goes after </VI> (`fpclass`) - its control reference is typed by it
+                self.fp_classes = getattr(self, "fp_classes", [])
+                annex = next((p for p in (ddo.find("partsList") if ddo.find("partsList") is not None else [])
+                              if p.get("class") == "annex"), None)
+                self.fp_classes.append((el, cls, self._listbox_strings(ddo) if cls in ("listbox", "mcListbox") else None,
+                                        annex.findtext("rsrcID") if annex is not None else None))
+            elif cls == "stdGraph":
+                rid = next((pt.findtext("rsrcID") for pt in (ddo.find("partsList") if ddo.find("partsList") is not None else [])
+                            if pt.get("class") == "annex" and pt.findtext("rsrcID")), None)
+                if rid:
+                    el.set("style", "graph" + rid)
+            el.set("uid", ddo.get("uid"))
+            el.set("uid_parent", "?")
+            dd = fpdco.findtext("DefaultData")
+            el.set("value", self.default_value(tree, dd, self.tid_tree(fpdco, True), "%s %r" % (el.tag, el.get("_name"))) if t else "")
+            con = fpdco.findtext("conNum")
+            con = "0" if con is None else con
+            if con != "-1" and con in pane:
+                el.set("conIdx", con)
+                el.set("connection", pane[con])
+            self.fp_by_uid[fpdco.get("uid")] = el
+        self.fp_placed = set()
+        self.ctl_by_ddo = {el.get("uid"): el for el in self.fp_by_uid.values()}
+        # a feedback node is two heap nodes; inside a loop its initializer is the LOOP's
+        self.slaves = {e.get("uid"): e for e in b.bd.iter("SL__arrayElement") if e.get("class") == "slaveFBInputNode"}
+        self.fb_inits = {}
+        for e in b.bd.iter("SL__arrayElement"):
+            d = e.find("dco")
+            if e.get("class") == "term" and d is not None and d.get("class") == "initFeedback" and d.find("rsrDCO") is not None:
+                self.fb_inits[d.find("rsrDCO").get("uid")] = e
+        root = b.bd.find("root")
+        self.walk(root, "root", self.out)
+        is_control_file = name.lower().endswith((".ctl", ".ctt"))
+        for uid, el in self.fp_by_uid.items():
+            if uid not in self.fp_placed:
+                if is_control_file:
+                    # a .ctl whose control has NO terminal on its diagram - the usual case for one
+                    # LabVIEW saved: NI's export writes no element for it (18 of 46 compared,
+                    # 2026-10-14), so neither does this; the note keeps it visible
+                    self.notes.append("%s %r has no terminal on the control's diagram, and NI's "
+                                      "export writes no element for it" % (el.tag, el.get("_name")))
+                    continue
+                # its terminal sits in a construct this reader does not walk yet
+                el.set("uid_parent", "root")
+                self.out.insert(0, el)
+                self.notes.append("%s %r: its terminal was not found on a walked diagram" % (el.tag, el.get("_name")))
+        for d in self.diags:
+            self.wire(d)
+        self._name_sourceless()
+        if getattr(self, "event_timeouts", None):
+            wired = {t.get("uid") for d in self.diags for sig in (d.find("signalList") if d.find("signalList") is not None else [])
+                     for t in sig.find("termList")}
+            for tu, nuid, kind in self.event_timeouts:
+                if tu in wired:
+                    self.notes.append("%s %s: its wired timeout is not carried by AIXML" % (kind, nuid)
+                                      if kind == "Event Structure" else
+                                      "%s %s: its wired timing is not carried by AIXML" % (kind, nuid))
+        # a node's inputs and outputs in TERMINAL order: signal order put Build Array's two
+        # `element`s the wrong way round (a round trip of t66 built [2.5,7] for [7,2.5])
+        per_el = {}
+        seen = set()
+        for tu in self.term_owner.order:
+            if tu in seen:
+                continue
+            seen.add(tu)
+            if self.term_owner[tu] is IGNORED:
+                continue
+            el, nm, sink = self.term_owner[tu]
+            if el.tag in ("Node", "Call") and nm not in INTERNAL_TERMS:
+                per_el.setdefault(id(el), (el, []))[1].append((tu, nm, sink))
+        for el, terms in per_el.values():
+            # A CALL lists every terminal of its callee's pane, an unwired one with an empty net, as
+            # NI's exporter writes it (5 686 of 15 655 call inputs and 4 278 of 10 402 outputs in
+            # the cached exports are `name:`). Wired-only left a polymorphic VI's instances - whose
+            # calls are never wired - with no terminals at all, and lvai_vi_terminals on the
+            # pylabview backend then had nothing to name (Trim Whitespace.vi, 2026-10-15). A name
+            # the reader could not establish (`?`) stays out rather than going in as a terminal.
+            # Primitives keep wired-only: their unwired names come from a table with gaps.
+            # A FORMULA NODE lists every variable too - its names are its own (vblName), and an
+            # unwired OUTPUT is how the code declares a variable it assigns: NI's export of Cut
+            # Length.vi writes `outputs="m:..,n:..,a:,b:,d:.."`; dropped, the composed node's
+            # `a=...` was `Undefined variable` (3 broken examples, 2026-11-06).
+            # Every PRIMITIVE terminal too, since 2026-11-06: NI lists them all, an unwired one as
+            # `name:` (Wait (ms)'s timer output on 309 nodes, Format Into String's error in on 162).
+            # A node BOUND to a control by link= has no reference terminals in NI's export (418 of
+            # 418), so an unwired reference/reference out stays out there.
+            every = el.tag in ("Call", "Node")
+            linked = el.get("link") is not None
+            drop = self.clfn_dropped()
+            if drop:
+                # a CLFN return value has two terms of one name: list it once, the wired one if any.
+                # Two PARAMETERS of one label stay two entries, as NI writes them (FIR Filter
+                # (CDB).vi's `type for the shift register`, 2026-11-08) - they were collapsed into
+                # one until then, and the second one's wire was lost
+                terms = [x for x in terms if x[0] not in drop]
+
+            clfn = el.get("_name") == "Call Library Function Node"
+
+            def listed(tu, nm):
+                if tu in self.term_net or clfn:
+                    # EVERY terminal of a CLFN, an unlabelled `?` too: the composer pairs a
+                    # repeated name with the n-th terminal of that name, and an unwired `?` left
+                    # out moved the wired one onto the return value (Real Compact Tri-Matrix
+                    # Inverse.vi, 2026-11-08: "input connected to an Indicator")
+                    return True
+                if not every or nm.startswith("?"):
+                    return False
+                return not (linked and nm in ("reference", "reference out"))
+            ins = ["%s:%s" % (escape(nm), self.term_net.get(tu, "")) for tu, nm, sink in terms
+                   if sink and listed(tu, nm)]
+            outs = ["%s:%s" % (escape(nm), self.term_net.get(tu, "")) for tu, nm, sink in terms
+                    if not sink and listed(tu, nm)]
+            for attr, items in (("inputs", ins), ("outputs", outs)):
+                if items:
+                    el.set(attr, ",".join(items))
+                elif attr in el.attrib:
+                    del el.attrib[attr]
+        for el, order in self.ordered_inputs.values():
+            el.set("inputs", ",".join("%s:%s" % (escape(nm), self.term_net.get(u, "")) for u, nm in order))
+        for el, attr, order in self.ordered_ports:
+            if any(self.term_net.get(u) for u, _ in order):
+                el.set(attr, ",".join("%s:%s" % (escape(nm), self.term_net.get(u, "")) for u, nm in order))
+            elif attr in el.attrib:
+                del el.attrib[attr]
+        # an UNWIRED terminal still carries its attribute with an empty net, as NI writes it on
+        # every one of its 404 unwired controls and 79 indicators - 0 of ~5 500 omit it - and as
+        # the schema requires (CLAUDE.md, cold-build-shakerrig.md section 2)
+        for el in self.fp_by_uid.values():
+            attr = "inputs" if el.tag == "Indicator" else "outputs"
+            if not el.get(attr):
+                el.set(attr, "value:")
+        # ...and so does every side a TUNNEL, shift register, Condition or diagram constant HAS:
+        # NI writes an unwired one as `value:` - a case frame's In half `outputs="value:"` (2 522
+        # times over NI's 1 784 shipping examples), its Out half `inputs="value:"` (1 433), a loop
+        # tunnel's unused inner side, a Right whose value nobody reads. Wired-only, the reader lost
+        # 4 281 tunnel terminals and 507 more on shift registers, constants and conditions
+        # (compare_corpus.py, 2026-11-06). A side the element does not have - a case frame half's
+        # outer one - was never registered, so it stays absent as in NI's export.
+        for tu in self.term_owner.order:
+            owner = self.term_owner.get(tu)
+            if owner is None or owner is IGNORED:
+                continue
+            el, nm, sink = owner
+            if el.tag in ("Tunnel", "Left", "Right", "Constant", "Condition") and nm == "value":
+                attr = "inputs" if sink else "outputs"
+                if not el.get(attr):
+                    el.set(attr, "value:")
+        if self.anchored:
+            by_uid = {}
+            for e in self.out.iter():
+                if isinstance(e.tag, str) and e.get("uid"):
+                    by_uid.setdefault(e.get("uid"), e)
+            # a comment anchored to a TERMINAL names its term or its dco - a control's terminal on
+            # the diagram, a tunnel's inner side (Map Collection - Comparing Test Results.vi,
+            # Replicate Core.vi): its owner is the element that terminal belongs to
+            term_of_dco = {}
+            for t in self.b.bd.iter("SL__arrayElement"):
+                if t.get("class") == "term" and t.find("dco") is not None and t.find("dco").get("uid"):
+                    term_of_dco.setdefault(t.find("dco").get("uid"), t.get("uid"))
+            for uid, text in self.anchored.items():
+                e = by_uid.get(uid)
+                if e is None:
+                    owner = self.term_owner.get(uid) if uid in self.term_owner else \
+                        self.term_owner.get(term_of_dco.get(uid)) if term_of_dco.get(uid) in self.term_owner else None
+                    if owner is not None and owner is not IGNORED and owner is not MISSING:
+                        e = owner[0]
+                if e is None:
+                    self.notes.append("comment anchored to object %s, which has no element here: %r"
+                                      % (uid, text[:60]))
+                else:
+                    e.set("comment", escape_description(text))
+        for name, (status, detail) in sorted(self.typedef_findings().items()):
+            self.notes.append("typedef %s: %s - %s" % (
+                name, "DRIFT, the embedded copy is stale" if status == "drift"
+                else "UNVERIFIED snapshot, read from the copy this file embeds", detail))
+        for uid, (target, status, details) in sorted(self.subvi_findings.items()):
+            self.notes.append("subVI call %s (%s): %s - %s" % (
+                uid, target, "DRIFT, the callee's pane changed since this VI was saved, read from "
+                "the callee" if status == "drift" else "UNVERIFIED, read from the caller's copy",
+                "; ".join(details)))
+        for n in self.notes:
+            # `--` ends an XML comment, and DQMH names every typedef `...--cluster.ctl`
+            self.out.append(ET.Comment(" vi2aixml: " + n.replace("--", "- -") + " "))
+        return self.out
+
+    def walk(self, diag, parent_uid, container):
+        """One diagram: its sRN terminals (front-panel terminals, constants), then every node;
+        a structure recurses into its diagrams with the structure (or frame) as parent."""
+        self.diags.append(diag)
+        for node in self.node_defs(diag):
+            cls = node.get("class")
+            if cls == "sRN":
+                for term in node.find("termList"):
+                    tc = term.get("class")
+                    d = term.find("dco")
+                    if tc == "fPTerm":
+                        el = self.fp_by_uid.get(d.get("uid"))
+                        if el is not None:
+                            if d.get("uid") not in self.fp_placed:
+                                el.set("uid_parent", parent_uid)
+                                container.append(el)
+                                self.fp_placed.add(d.get("uid"))
+                            self.term_owner[term.get("uid")] = (el, "value", el.tag == "Indicator")
+                    elif tc == "term" and d is not None and d.get("class") == "bDConstDCO" and \
+                            d.find("ddo") is not None and d.find("ddo").get("class") == "bDFixed":
+                        code = d.find("ddo").findtext("cnst") or "00"
+                        name = FIXED_BY_CODE.get(code.upper(), "?fixed " + code)
+                        c = ET.Element("FixedConst", {"_name": name, "uid": d.find("ddo").get("uid"), "uid_parent": parent_uid})
+                        self.term_owner[term.get("uid")] = (c, "value", False)
+                        container.append(c)
+                    elif tc == "term" and d is not None and d.get("class") == "bDConstDCO":
+                        c = self.constant(term, parent_uid)
+                        container.append(c)
+                continue
+            el = None
+            if cls in aixml2vi.PRIM_CLASSES:
+                el = self.prim(node, parent_uid)
+            elif cls in ("whileLoop", "forLoop", "timeLoop"):
+                el = self.loop(node, parent_uid)
+            elif cls == "select":
+                el = self.case(node, parent_uid)
+            elif cls == "eventStruct":
+                el = self.case(node, parent_uid, event=True)
+            elif cls == "sequence":
+                el = self.stackedseq(node, parent_uid)
+            elif cls == "flatSequence":
+                el = self.flatseq(node, parent_uid)
+            elif cls == "decomposeRecomposeStructure":
+                el = self.inplace(node, parent_uid)
+            elif cls in ("decomposeMatchNode", "decomposeArrayNode", "decomposeClusterNode"):
+                continue        # read with its In Place Element Structure
+            elif cls == "commentNode":
+                el = self.disable(node, parent_uid)
+            elif cls in ("iUse", "polyIUse", "dynIUse"):
+                el = self.call(node, parent_uid)
+            elif cls == "callParentDynIUse":
+                # CALL PARENT CLASS METHOD, as NI's export writes it - a Node, no target, the
+                # terminals named by this call's own pane labels (`Panel Actor in`, `Actor out`);
+                # the composer finds the parent's method itself (the XControl sweep, 2026-10-22)
+                el = self.call(node, parent_uid)
+                el.tag = "Node"
+                el.attrib = dict([("_name", "Call Parent Class Method")] +
+                                 [(k, v) for k, v in el.attrib.items() if k not in ("target", "instance", "adapt")])
+            elif cls in TEMPLATE_CLASSES:
+                el = self.template_node(node, parent_uid)
+            elif cls in NODE_READERS:
+                el = getattr(self, NODE_READERS[cls])(node, parent_uid)
+            elif cls in ("slaveFBInputNode",):
+                continue        # read with its hiddenFBNode
+            else:
+                self.notes.append("diagram node of class %s (uid %s) not read" % (cls, node.get("uid")))
+            if el is not None:
+                container.append(el)
+        self.comments(diag, parent_uid, container)
+
+    def comments(self, diag, parent_uid, container):
+        """The diagram's comments, as NI's exporter writes them. A comment is a `label` with no
+        partID straight in the diagram's zPlaneList (a control's or node's own label sits in a
+        partsList, a subdiagram label carries partID 8024), and each points at an `attachment`.
+        An attachment holding an `attachedObject` is a comment ANCHORED to that object: NI writes
+        it as `comment=` on the object's element (Call, Node, Constant, Structure ... 178 of them
+        in the cached exports), collected here and set once every element exists. One without is
+        a free comment: `<FreeLabel comment="..." uid=<the label's uid>/>` in this diagram -
+        2 603 in the cached exports, escaped like a description."""
+        if self.attachments is None:
+            self.attachments = {e.get("uid"): e for e in self.b.bd.iter("SL__arrayElement")
+                                if e.get("class") == "attachment"}
+        z = diag.find("zPlaneList")
+        for o in (z if z is not None else []):
+            if o.get("class") != "label" or o.find("textRec") is None or o.findtext("partID") is not None:
+                continue
+            t = o.findtext("textRec/text")
+            # pylabview writes a byte with no printable form as the literal text `&#xNN;` - a CR
+            # or a NUL in a comment - and NI keeps both (`\0D`, `\00`), so they are decoded,
+            # not dropped (DW Test Copy.vi, the TLS example, 2026-10-21)
+            text = "" if t in (None, "[NULL]") else \
+                re.sub(r"&#x([0-9A-Fa-f]{2});", lambda m: chr(int(m.group(1), 16)), unquote(t))
+            # and it renders the bytes as MacRoman where LabVIEW on Windows wrote CP1252: NI's
+            # `devices’ sample` came back `devicesí sample` (Analog Input - Synchronization.vi)
+            try:
+                text = text.encode("mac_roman").decode("cp1252")
+            except (UnicodeEncodeError, UnicodeDecodeError):
+                pass
+            a = o.find("attachment")
+            att = self.attachments.get(a.get("uid")) if a is not None else None
+            owner = att.find("attachedObject") if att is not None else None
+            if owner is not None and owner.get("uid"):
+                self.anchored.setdefault(owner.get("uid"), text)
+                continue
+            container.append(ET.Element("FreeLabel", {"comment": escape_description(text),
+                                                      "uid": o.get("uid"), "uid_parent": parent_uid}))
+
+    # ---- elements ----------------------------------------------------------------------------
+    def default_value(self, tree, dd, snap=None, what="default"):
+        if dd is None:
+            return empty_value(tree)
+        # pylabview renders DefaultData as MacRoman text with &#x..; escapes for unprintables
+        raw = dd.strip('"')
+        out = bytearray()
+        i = 0
+        while i < len(raw):
+            if raw.startswith("&#x", i) and ";" in raw[i:i + 8]:
+                j = raw.index(";", i)
+                out.append(int(raw[i + 3:j], 16))
+                i = j + 1
+            else:
+                out.extend(raw[i].encode("mac_roman"))
+                i += 1
+        return self.stored_value(tree, snap, out.hex(), what) or ""
+
+    @staticmethod
+    def _combo_box(el, ddo):
+        """A combo box's style and items: the strings of the listbox inside it
+        (baseListboxItemStrings), in the station's code page, a comma escaped as in a ring."""
+        el.set("style", "Combo Box")
+        elems = ddo.find(".//baseListboxItemStrings/multiDimArrayElems")
+        labels = [heap_text(x.text) for x in (elems if elems is not None else [])]
+        if labels:
+            el.set("items", ",".join(escape(x).replace(",", "\\2C") for x in labels))
+
+    @staticmethod
+    def _ring(el, ring, t):
+        """A RING's items and, where they are not 0..n-1, its values, as NI's export writes them on
+        a control, an indicator and a diagram constant alike: `style="Ring" items="a,b"
+        values="[2125,3441]"`. The items are the multiLabel buf's quoted strings, the values the
+        ddo's ringSparseValues (hex). Until 2026-11-06 a diagram RING CONSTANT was read as its
+        plain number (83 over NI's shipping examples) and no ring carried its values (42)."""
+        buf = next((p.findtext("buf") for p in ring.iter("SL__arrayElement")
+                    if p.get("class") == "multiLabel" and p.find("buf") is not None), None)
+        # the items in the station's code page, as heap_text reads every other heap string: an en
+        # dash came out `Ð` until 2026-11-19
+        labels = [heap_text('"%s"' % x) for x in re.findall(r'"([^"]*)"', buf or "")]
+        if not labels:
+            # a ring with NO items is written as its plain number (Simple Polar Plot.vi, Change
+            # Cursor Icon.vi, 2026-11-06)
+            return
+        el.set("items", ",".join(escape(x).replace(",", "\\2C") for x in labels))
+        el.set("style", "Ring")
+        sparse = ring.find("ringSparseValues")
+        if sparse is not None and len(sparse):
+            # each value a SIGNED heap integer of as few bytes as hold it (`FF` is -1); an
+            # unsigned ring's value is that integer in the type's width (`FF` on a uint32 ring is
+            # 4294967295 - read as 255 until 2026-11-19)
+            ubits = {"uint8": 8, "uint16": 16, "uint32": 32, "uint64": 64}.get(t)
+            vals = []
+            for x in sparse:
+                hx = (x.text or "0").strip() or "0"
+                v = int(hx, 16)
+                if v >= 1 << (4 * len(hx) - 1):
+                    v -= 1 << (4 * len(hx))
+                if ubits and v < 0:
+                    v += 1 << ubits
+                vals.append(str(v))
+            el.set("values", "[%s]" % ",".join(vals))
+
+    def constant(self, term, parent_uid):
+        dco = term.find("dco")
+        ddo = dco.find("ddo")
+        tree = self.tid_tree(term)
+        t = aixml_type(tree)
+        el = ET.Element("Constant")
+        name = label_text(ddo)
+        if name:
+            el.set("_name", name_attr(name))
+        el.set("type", t or "?" + lvheap.type_key(tree))
+        if t:
+            self._note_classes(el, tree)
+        el.set("uid", ddo.get("uid"))
+        el.set("uid_parent", parent_uid)
+        # a plain ring constant only: a TYPEDEF'd one is written as its number in NI's export (59
+        # of 59 over the shipping examples), unlike a typedef'd ring CONTROL
+        if ddo.get("class") == "stdRing" and t is not None and "{" not in t:
+            self._ring(el, ring=ddo, t=t)
+        if dco.find("ConstValue") is None:
+            # NOT a default: measured 2026-10-15 over the cache, every constant of a file saved by
+            # LabVIEW 11 or later carries ConstValue (5 803 of 5 803), and only the LabVIEW 9.0
+            # files lack it - their values live in the compiled data space, which pylabview does
+            # not decode, and 64 of their 78 are not the default. Decoding "" as 0/false/"" made
+            # Dictionary Example.vi's 57 constants plausible and wrong.
+            el.set("value", "")
+            self.notes.append("constant %s: value not stored in the block diagram heap (a file from "
+                              "before LabVIEW 11 keeps it in compiled code) - not decoded" % ddo.get("uid"))
+            self.term_owner[term.get("uid")] = (el, "value", False)
+            return el
+        v = self.stored_value(tree, self.tid_tree(term, True), dco.findtext("ConstValue") or "",
+                              "constant %s" % ddo.get("uid")) if t else None
+        el.set("value", v if v is not None else "")
+        if v is None:
+            self.notes.append("constant %s: value of type %s not decoded" % (ddo.get("uid"), lvheap.type_key(tree)))
+        self.term_owner[term.get("uid")] = (el, "value", False)
+        return el
+
+    def prim(self, node, parent_uid):
+        rid = aixml2vi.prim_res_id(node)     # a stream Read/Write node's too (aixml2vi.PRIM_CLASSES)
+        self.prim_rid = getattr(self, "prim_rid", {})
+        self.prim_rid[node.get("uid")] = rid
+        name = self.prim_name.get(rid)
+        if name and name.startswith("TCP "):
+            # the TCP primitives serve IrDA and Bluetooth too, told apart only by the connection
+            # refnum's type - NI names them `IrDA Read`, `Bluetooth Write` (15 over its Simple IrDA
+            # and Simple Bluetooth examples, 2026-11-06)
+            for term in node.find("termList"):
+                tr = self.tid_tree(term)
+                kind = {"IrdaNetConn": "IrDA ", "BluetoothCon": "Bluetooth "}.get(tr.get("RefType") if tr is not None else None)
+                if kind:
+                    name = kind + name[len("TCP "):]
+                    break
+        el = ET.Element("Node", {"_name": name or "?primResID %s" % rid,
+                                 "uid": node.get("uid"), "uid_parent": parent_uid})
+        if name is None:
+            self.notes.append("primitive primResID %s has no name in the table" % rid)
+        for attr, bit in aixml2vi.Composer.PRIM_MODE_BITS.get(name, {}).items():
+            if int(node.findtext("objFlags") or 0) & bit:
+                el.set(attr, "true")
+        if name == "Array To Cluster":
+            # its cluster SIZE is the output's field count, which NI's exporter writes as
+            # elements="N" on every such node; left out, the composer takes LabVIEW's default
+            # of nine and a round trip of a three-field node came back broken
+            for term in node.find("termList"):
+                if term.find("dco").findtext("parmIndex") is None:
+                    tree = self.tid_tree(term.find("dco"))
+                    if tree is not None and tree.get("Type") == "Cluster":
+                        el.set("elements", str(len(aixml2vi.fields(tree))))
+        slots = sorted(int(t.find("dco").findtext("parmIndex")) for t in node.find("termList")
+                       if t.find("dco") is not None and t.find("dco").findtext("parmIndex"))
+        compact = self.COMPACT_FORMS.get(int(rid)) if slots == list(range(1, len(slots) + 1)) else None
+        for term in node.find("termList"):
+            dco = term.find("dco")
+            pidx = aixml2vi.term_slot(dco, node.get("class"))
+            tname = self.term_names.get((rid, pidx), "?parm%s" % pidx)
+            if compact is not None:
+                tname = compact.get(int(dco.findtext("parmIndex") or 0), tname)
+            sink = bool(int(term.findtext("objFlags") or 0) & SINK)
+            if not sink and not self._is_out(term) and not (int(term.findtext("objFlags") or 0) & SOFT_SINK):
+                # an UNWIRED input carries no SINK flag on its term - only its DCO says it is no
+                # output. Wired-only that never mattered; listed unwired, Format Into String's
+                # `error in` and `initial string` went out as OUTPUTS (162 each over NI's
+                # examples, 2026-11-06)
+                sink = True
+            self.term_owner[term.get("uid")] = (el, tname, sink)
+            if int(term.findtext("objFlags") or 0) & SOFT_SINK:
+                self.soft_sinks = getattr(self, "soft_sinks", set())
+                self.soft_sinks.add(term.get("uid"))
+        return el
+
+    def pythonnode(self, node, parent_uid):
+        """A PYTHON NODE (heap class Class0183), as NI's export writes it: `session in`, `module
+        path`, `function name`, `error in (no error)`, then `return type` and one `input parameter`
+        per argument; out `session out`, `error out`, `return value` and one `value` per argument.
+        The fixed terminals are hGrowCItems (session by DCO flags 0x10000/0x40001, error by
+        0x20000/0x80001, module path and function name by their labels - their pass-through outputs
+        are not in NI's export); the arguments Class0184 terms, each followed by its dco-less output
+        side, the FIRST the return value. 11 nodes over NI's Python examples were not read at all
+        until 2026-11-06."""
+        return self._session_call_node(node, parent_uid, "Python Node", ("module path", "function name"))
+
+    def xdatanode(self, node, parent_uid):
+        """A Timed Loop's (or Timed Sequence's) DATA NODE: NI's export writes no element for it and
+        leaves its wire ends out, naming a net it fed after that net's first consumer (`selectin=
+        "228.value"`, Timed Loop Abort.vi). Its terminals are IGNORED here the same way, so the rest
+        of each wire stays; the note keeps the loss visible, and the composer refuses on it."""
+        for t in (node.find("termList") if node.find("termList") is not None else []):
+            self.term_owner[t.get("uid")] = IGNORED
+        self.notes.append("diagram node of class xDataNode (uid %s) not read" % node.get("uid"))
+        return None
+
+    def buildmap(self, node, parent_uid):
+        """BUILD MAP (Class018B): out `map`, in alternating `key` and `value`, as NI's export writes
+        it (Map Collection - Comparing Test Results.vi, not read until 2026-11-06)."""
+        el = self._node_el(node, parent_uid, "Build Map")
+        k = 0
+        for t in node.find("termList"):
+            if self._is_out(t):
+                self.term_owner[t.get("uid")] = (el, "map", False)
+            else:
+                self.term_owner[t.get("uid")] = (el, "key" if k % 2 == 0 else "value", True)
+                k += 1
+        return el
+
+    def eventregcallback(self, node, parent_uid):
+        """REGISTER EVENT CALLBACK, as NI's export writes it: `event callback refnum`, `error in
+        (no error)`, `event source`, `VI Ref` and the user parameter (by its label, else `User
+        Parameter`) in; `event callback refnum` and `error out` out - roles by DCO flags (3 nodes
+        over NI's .NET and ActiveX examples, not read until 2026-11-06)."""
+        el = self._node_el(node, parent_uid, "Register Event Callback")
+        roles = {65536: ("event callback refnum", True), 262145: ("event callback refnum", False),
+                 131072: ("error in (no error)", True), 524289: ("error out", False)}
+        item_roles = {131072: "event source", 524288: "VI Ref"}
+        for t in node.find("termList"):
+            d = t.find("dco")
+            if d is None:
+                continue
+            f = int(d.findtext("objFlags") or 0)
+            if d.get("class") == "hGrowCItem":
+                role = roles.get(f)
+                self.term_owner[t.get("uid")] = (el, role[0], role[1]) if role else IGNORED
+            elif d.get("class") == "eventRegCBItem":
+                tree = self.tid_tree(t)
+                nm = item_roles.get(f) or (tree.get("Label") if tree is not None else None) or "User Parameter"
+                self.term_owner[t.get("uid")] = (el, nm, True)
+        return el
+
+    def constructornode(self, node, parent_uid):
+        """A .NET CONSTRUCTOR NODE, as NI's export writes it: target the constructed type
+        (methName), type {DotNet} - {DotNetCore} for a .NET Core refnum, which pylabview keeps raw -
+        `error in (no error)` in, `new reference` and `error out` out, and each constructor parameter
+        by its label on both sides. The method's own Void item and the unused reference input are not
+        listed (6 nodes over NI's examples, not read until 2026-11-06)."""
+        el = self._node_el(node, parent_uid, "Constructor Node", target=unquote(node.findtext("methName") or ""))
+        fixed = {262145: ("new reference", False), 131072: ("error in (no error)", True),
+                 524289: ("error out", False)}
+        dotnet = None
+        last = None
+        for t in node.find("termList"):
+            d = t.find("dco")
+            if d is None or d.get("class") is None:
+                if last is not None:
+                    self.term_owner[t.get("uid")] = (el, last, False)
+                else:
+                    self.term_owner[t.get("uid")] = IGNORED
+                last = None
+                continue
+            tree = self.tid_tree(t)
+            if d.get("class") == "hGrowCItem":
+                last = None
+                role = fixed.get(int(d.findtext("objFlags") or 0))
+                if role and role[0] == "new reference" and tree is not None:
+                    dotnet = "DotNet" if tree.get("RefType") == "DotNet" else "DotNetCore"
+                self.term_owner[t.get("uid")] = (el, role[0], role[1]) if role else IGNORED
+                continue
+            if int(d.findtext("objFlags") or 0) in (196616, 196617):
+                # the constructor's own item pair (its Void in, its class out): not a parameter
+                last = None
+                self.term_owner[t.get("uid")] = IGNORED
+                continue
+            # a parameter: an input item, then its output item (Void, labelled alike), both listed
+            out = self._is_out(t)
+            name = (tree.get("Label") if tree is not None else None) or (last if out else None) or "?"
+            last = name
+            self.term_owner[t.get("uid")] = (el, name, not out)
+        el.set("type", "{%s}" % (dotnet or "DotNet"))
+        return el
+
+    def sharedvariable(self, node, parent_uid):
+        """A SHARED VARIABLE node, as NI's export writes it: the value terminal named after the
+        variable (`name4`, hex), `error in (no error)` and `error out` - which variable of which
+        library it binds is not in AIXML (8 nodes over NI's examples, not read until 2026-11-06)."""
+        el = self._node_el(node, parent_uid, "Shared Variable")
+        try:
+            var = bytes.fromhex(node.findtext("name4") or "").decode("cp1252")
+        except ValueError:
+            var = "?"
+        first = True
+        for t in node.find("termList"):
+            out = self._is_out(t)
+            tree = self.tid_tree(t)
+            if first:
+                nm = var or "?"
+                first = False
+            elif tree is not None and tree.get("Type") == "Cluster":
+                nm = "error out" if out else "error in (no error)"
+            else:
+                nm = "?"
+            self.term_owner[t.get("uid")] = (el, nm, not out)
+        return el
+
+    def mergesignals(self, node, parent_uid):
+        """MERGE SIGNALS (mergeSignal): one output, `combined signal` (DCO bit 0), and an `input
+        signal` per input, as NI's export writes it (11 nodes over its Express VI examples were
+        not read until 2026-11-06)."""
+        el = self._node_el(node, parent_uid, "Merge Signals")
+        for t in node.find("termList"):
+            out = self._is_out(t)
+            self.term_owner[t.get("uid")] = (el, "combined signal" if out else "input signal", not out)
+        return el
+
+    def matlabnode(self, node, parent_uid):
+        """A CALL MATLAB FUNCTION node (Class0193): the Python Node's layout, with `source file
+        path` its one labelled input (NI's MATLAB Node examples, 2026-11-06)."""
+        return self._session_call_node(node, parent_uid, "Call MATLAB Function", ("source file path",))
+
+    def _session_call_node(self, node, parent_uid, name, labelled):
+        el = self._node_el(node, parent_uid, name)
+        fixed = {65536: ("session in", True), 262145: ("session out", False),
+                 131072: ("error in (no error)", True), 524289: ("error out", False)}
+        arg = 0
+        last = None
+        for t in node.find("termList"):
+            d = t.find("dco")
+            if d is None or d.get("class") is None:
+                if last is not None:
+                    self.term_owner[t.get("uid")] = (el, "return value" if last == 1 else "value", False)
+                else:
+                    self.term_owner[t.get("uid")] = IGNORED
+                last = None
+                continue
+            if d.get("class") == "hGrowCItem":
+                last = None
+                role = fixed.get(int(d.findtext("objFlags") or 0))
+                if role is None:
+                    tree = self.tid_tree(t)
+                    label = tree.get("Label") if tree is not None else None
+                    role = (label, True) if label in labelled else None
+                if role:
+                    self.term_owner[t.get("uid")] = (el, role[0], role[1])
+                else:
+                    self.term_owner[t.get("uid")] = IGNORED
+                continue
+            arg += 1
+            last = arg
+            self.term_owner[t.get("uid")] = (el, "return type" if arg == 1 else "input parameter", True)
+        return el
+
+    def extfunc(self, node, parent_uid):
+        """A CALL LIBRARY FUNCTION NODE, as NI's export writes it: its terminals and nothing of its
+        configuration - `inputs="error in (no error):,input:..,output:"` and the same names out.
+        Each terminal is named by its TYPE's label (the parameter's name); a parameter is an
+        extFuncArg term (its input side, SINK) and the dco-less term after it (its output side); the
+        return value's extFuncArg carries no SINK and is an output only. A Void terminal - an
+        unconfigured path in/out, a void return - is not listed (59 nodes over NI's shipping
+        examples, 2026-11-06). The library and function are not in AIXML, so the note keeps the
+        composer from building a node that calls nothing."""
+        el = self._node_el(node, parent_uid, "Call Library Function Node")
+        terms = list(node.find("termList"))
+        last = None
+        seen = {}
+        for t in terms:
+            d = t.find("dco")
+            argno = getattr(self, "_clfn_args", {}).get(node.get("uid"), 0)
+            if d is None or d.get("class") is None:
+                # the output side of the parameter before it: a bare reference to its DCO
+                if last is not None:
+                    self._extfunc_term(el, t, last, False, seen, argno)
+                else:
+                    self.term_owner[t.get("uid")] = IGNORED
+                continue
+            tree = self.tid_tree(t)
+            label = (tree.get("Label") if tree is not None else None) or "?"
+            if d.get("class") == "extFuncArg":
+                # count every argument, a VOID return included: the first is the return value
+                self._clfn_args = getattr(self, "_clfn_args", {})
+                self._clfn_args[node.get("uid")] = self._clfn_args.get(node.get("uid"), 0) + 1
+            if tree is not None and tree.get("Type") == "Void":
+                last = None
+                self.term_owner[t.get("uid")] = IGNORED
+                continue
+            if d.get("class") == "extFuncArg":
+                last = label
+                if self._clfn_args[node.get("uid")] > 1:
+                    # a PARAMETER: its input side even unwired (SINK is set only on a wired one -
+                    # 38 `output` inputs missing over NI's DLL examples, 2026-11-06)
+                    self._extfunc_term(el, t, label, True, seen, argno + 1)
+                else:
+                    # the FIRST argument is the RETURN value: an output, listed once with the
+                    # output side after it
+                    self._extfunc_term(el, t, label, False, seen, argno + 1)
+            else:
+                last = None
+                self._extfunc_term(el, t, label, not self._is_out(t), seen)
+        off = int(node.get("uid"))
+        nexf = None
+        for r in self.b.main.iter("NEXF"):
+            for o in r.findall("LinkOffsetList/Offset"):
+                try:
+                    if int((o.text or "").strip(), 16) == off:
+                        nexf = r
+                except ValueError:
+                    pass
+        # its configuration goes after </VI> (<?lvmcp clfn?>), where NI's service ignores it. A node
+        # whose library path is WIRED (`Specify path on diagram`, objFlags 0x100000) has no NEXF
+        # record in LabVIEW's own save either - 5 of 40 sampled vi.lib VIs, POSTMultipart.vi among them
+        self.clfn_nodes = getattr(self, "clfn_nodes", [])
+        self.clfn_nodes.append((el, node, nexf))
+        return el
+
+    def _extfunc_term(self, el, t, name, sink, seen, arg=None):
+        """Register one CLFN terminal; a name already registered on that side (the return value's
+        two terms) is registered again only for the wire, not listed twice."""
+        key = (name, sink, arg)
+        self.term_owner[t.get("uid")] = (el, name, sink)
+        if key in seen:
+            # the second term of ONE argument on the same side: the return value's pair
+            self.clfn_twins = getattr(self, "clfn_twins", {})
+            self.clfn_twins[t.get("uid")] = seen[key]
+        else:
+            seen[key] = t.get("uid")
+
+    def clfn_dropped(self):
+        """The CLFN return-value terms left out of the listing: of each twin pair the unwired one,
+        the second where neither or both are wired."""
+        drop = set()
+        for b, a in getattr(self, "clfn_twins", {}).items():
+            drop.add(a if b in self.term_net and a not in self.term_net else b)
+        return drop
+
+    def clfn_payload(self, el, node, nexf):
+        """The node's CONFIGURATION for <?lvmcp clfn?> after </VI>: the extFunc heap object itself,
+        each type reference (typeDesc, funcTD - the function's signature cluster, PtrTo where a
+        parameter is passed by pointer) replaced by its type tree, each listed terminal marked with
+        the name and side the AIXML element lists it under, and the NEXF link record that names the
+        library and the function as `lvmcpLink`. The composer builds the node from it
+        (Composer.add_clfn); AIXML itself carries none of this."""
+        cp = copy.deepcopy(node)
+        drop = self.clfn_dropped()
+        for t in cp.find("termList"):
+            own = self.term_owner.get(t.get("uid"))
+            if isinstance(own, tuple) and own[0] is el and t.get("uid") not in drop:
+                t.set("lvmcp_name", own[1])
+                t.set("lvmcp_dir", "in" if own[2] else "out")
+        for e in list(cp.iter()):
+            tid = None
+            if e.tag == "typeDesc" and e.text and e.text.strip().startswith("TypeID("):
+                tid = int(e.text.strip()[7:-1])
+            elif e.tag == "funcTD" and e.text and e.text.strip():
+                tid = int(e.text.strip(), 16)
+            if tid is not None:
+                e.text = None
+                e.append(self.b.heap_type_tree(tid))
+        link = ET.SubElement(cp, "lvmcpLink", dict(nexf.attrib) if nexf is not None else {"none": "1"})
+        if nexf is None:
+            return ET.tostring(cp, encoding="unicode")
+        for q in nexf.findall("LinkSaveQualName/String"):
+            ET.SubElement(link, "Qual").text = q.text or ""
+        pr = nexf.find("LinkSavePathRef")
+        if pr is not None:
+            link.set("tp", pr.get("TpVal") or "0")
+            for c in pr.findall("String"):
+                ET.SubElement(link, "Path").text = c.text or ""
+        link.set("function", nexf.findtext("ExtFuncLinkStr") or "")
+        return ET.tostring(cp, encoding="unicode")
+
+    def xnode(self, node, parent_uid):
+        """An XNODE (xNode): NI's export writes it as a Call whose target is the .xnode - `Error
+        Ring.xnode` in Gaussian surface with offset model.vi - its terminals named by the xTunnels'
+        ids (hex of `error out`). Its diagram is the code the XNode GENERATED and is not read; the
+        composer refuses the call by name. It was dropped without a word until 2026-10-23, and the
+        Select it fed composed with an unwired input."""
+        recs = self.call_targets.get(node.get("uid"), {})
+        target = next((v for v in recs.values() if v and v.lower().endswith(".xnode")), None) or \
+            next(iter(recs.values()), None) or "?.xnode"
+        el = ET.Element("Call", {"uid": node.get("uid"), "uid_parent": parent_uid, "target": target})
+        names = {}
+        for t in node.find("termList"):
+            d = t.find("dco")
+            if d is None or d.get("class") != "xTunnel":
+                continue
+            # NI names the terminal by its TYPE's label, as on a subVI call: `file path` where the
+            # xTunnel's id says `10`, `error out` for `error out1` (the DataPlugin XNodes, 2026-11-06)
+            tree = self.tid_tree(t)
+            name = tree.get("Label") if tree is not None and tree.get("Label") else None
+            if name is None:
+                try:
+                    name = bytes.fromhex(d.findtext("id") or "").decode("mac_roman")
+                except ValueError:
+                    name = "?"
+            out = bool(int(d.findtext("objFlags") or 0) & 1)
+            self.term_owner[t.get("uid")] = (el, name, not out)
+            names[t.get("uid")] = name
+        if INLINE_XNODES and target.split(":")[-1] not in XNODE_REPLACE_ROUTES \
+                and node.find("diagramList/SL__arrayElement") is not None:
+            # and the code it GENERATED, for the composer to put in its place (<?lvmcp xnodeinline?>)
+            self.xnode_inlines = getattr(self, "xnode_inlines", [])
+            self.xnode_inlines.append((el, self.xnode_inline(node, parent_uid, target, names)))
+        # the node ITSELF - its generated code, state and links - goes after </VI> (<?lvmcp xnode?>);
+        # its DSIM images are read NOW, while the extracted files still exist (main() removes them
+        # before the payload is written)
+        want = set()
+        im = node.findtext("image")
+        if im and re.fullmatch(r"[0-9A-Fa-f]+", im.strip()):
+            want.add(int(im.strip(), 16))
+        for e in node.iter("ImageResID"):
+            try:
+                if int(e.text) > 0:
+                    want.add(int(e.text))
+            except (TypeError, ValueError):
+                pass
+        self.xnode_images = getattr(self, "xnode_images", {})
+        for sec in self.b.main.findall("DSIM/Section"):
+            if sec.get("Index") is not None and int(sec.get("Index")) in want and sec.get("File"):
+                fn = os.path.join(self.b.dir, sec.get("File"))
+                if os.path.isfile(fn):
+                    with open(fn, "rb") as f:
+                        self.xnode_images.setdefault(node.get("uid"), {})[int(sec.get("Index"))] = f.read().hex().upper()
+        self.xnode_nodes = getattr(self, "xnode_nodes", [])
+        self.xnode_nodes.append((el, node))
+        return el
+
+    def _wired_terms(self):
+        """uids of every terminal a wire (heap `signal`) ends at, anywhere on the diagram."""
+        w = getattr(self, "_wired", None)
+        if w is None:
+            w = set()
+            for s in self.b.bd.iter("SL__arrayElement"):
+                if s.get("class") == "signal" and s.find("termList") is not None:
+                    w.update(t.get("uid") for t in s.find("termList") if t.get("uid"))
+            self._wired = w
+        return w
+
+    def xnode_inline(self, node, parent_uid, target, names):
+        """An XNODE read as the code it GENERATED: a one-frame Flat Sequence holding the xNode's
+        own diagram, each xTunnel a tunnel of that frame, labelled with the .xnode it came from.
+        The xNode cannot be composed (its state, image and links: docs/aixml-backends.md, "XNodes:
+        carried, NOT composed"), and LabVIEW's {LV.SubVI} Replace builds one only in its DEFAULT
+        state - an Error Ring would lose the error it names. The generated code is what the node
+        RUNS, for exactly the types and the configuration it was saved with, so a VI holding one
+        round-trips with the same behaviour, the XNode drawn as its code (palette sweep,
+        2026-11-19: 24 NI examples refused on an XNode call). Built as flatseq builds a frame:
+        the xTunnel's inner half is a term of the diagram's sRN naming the same dco. The Call stays
+        what NI's export writes and owns the OUTER terms; this frame is DETACHED, each tunnel naming
+        the Call terminal it stands for (`xterm`), and goes after </VI> - the composer swaps it in
+        where it would refuse the XNode, so the reader's parity with NI's export is kept."""
+        el = ET.Element("Structure", {"_name": "Flat Sequence Frame", "uid": node.get("uid"), "uid_parent": parent_uid,
+                                      "label": target.split(":")[-1].replace(",", "\\2C").replace(":", "\\3A")})
+        diag = node.find("diagramList/SL__arrayElement")
+        owner = node.get("uid")
+        srn = next((n for n in self.node_defs(diag) if n.get("class") == "sRN"), None)
+        inner = {}
+        for t in (srn.find("termList") if srn is not None else []):
+            d = t.find("dco")
+            if d is not None:
+                inner.setdefault(d.get("uid"), []).append(t)
+        n_in = n_out = 0
+        tunnels = []
+        for term in node.find("termList"):
+            d = term.find("dco")
+            if d is None or d.get("class") != "xTunnel":
+                continue
+            out = int(d.findtext("objFlags") or 0) & 1
+            xterm = names.get(term.get("uid"))
+            if not out and term.get("uid") not in self._wired_terms():
+                # an input left UNWIRED outside that the generated code still reads (Database
+                # Delete.vi's DB Tools Delete Data): a tunnel no wire reaches has no type, so the
+                # value the code sees - the xTunnel's own default - becomes a constant inside
+                tree = self.tid_tree(term)
+                t = aixml_type(tree) if tree is not None else None
+                v = self.default_value(tree, d.findtext("DefaultData"), self.tid_tree(term, True),
+                                       "XNode input %s" % d.get("uid")) if t else None
+                if t and v is not None:
+                    c = ET.Element("Constant", {"type": t, "uid": d.get("uid"), "uid_parent": owner, "value": v})
+                    for it in inner.get(d.get("uid"), []):
+                        self.term_owner[it.get("uid")] = (c, "value", False)
+                    el.append(c)
+                    continue
+            if out:
+                n_out += 1
+            else:
+                n_in += 1
+            tun = ET.Element("Tunnel", {"_id": ("Out%d" % n_out) if out else ("In%d" % n_in),
+                                        "uid": d.get("uid"), "uid_parent": owner, "xterm": xterm or ""})
+            for t in inner.get(d.get("uid"), []):
+                self.term_owner[t.get("uid")] = (tun, "value", bool(out))
+            # the inner half may also be listed on the xTunnel itself (its termList: inner, outer)
+            for ref in (d.find("termList") if d.find("termList") is not None else []):
+                if ref.get("uid") and ref.get("uid") != term.get("uid"):
+                    self.term_owner.setdefault(ref.get("uid"), (tun, "value", bool(out)))
+            tunnels.append(tun)
+        self.walk(diag, owner, el)
+        for t in tunnels:
+            el.append(t)
+        return el
+
+    # heap fields holding a type as a hex heap integer, not TypeID(n)
+    HEX_TYPE_TAGS = ("stateTD", "funcTD")
+
+    def _typed_payload(self, cp):
+        """Every type reference in a copied heap subtree replaced by its type tree."""
+        for e in list(cp.iter()):
+            txt = (e.text or "").strip()
+            tid = None
+            if len(e) == 0 and re.fullmatch(r"TypeID\(\d+\)", txt):
+                tid = int(txt[7:-1])
+            elif e.tag in self.HEX_TYPE_TAGS and re.fullmatch(r"[0-9A-Fa-f]+", txt):
+                tid = int(txt, 16)
+            if tid is not None:
+                e.text = None
+                e.append(self.b.heap_type_tree(tid))
+
+    def xnode_payload(self, el, node):
+        """An XNODE for <?lvmcp xnode?>: the xNode heap object as LabVIEW saved it - its generated
+        diagram, StateData and stateTD (the state type, a hex heap integer), libVersion, icon -
+        with every type as a tree, each xTunnel terminal marked with the name and side the Call
+        lists it under, and the link records naming it or anything inside it: XNXI (the node ->
+        the .xnode library) and IUVI (a call in the generated code) from LIbd, with the IUVI's
+        VIVI from LIvi (its pane type as a tree), and the VI-level VIXN. Composer.add_xnode builds
+        it back; NI's AIXML has only the Call (2026-11-08)."""
+        cp = copy.deepcopy(node)
+        for t in cp.find("termList"):
+            own = self.term_owner.get(t.get("uid"))
+            if isinstance(own, tuple) and own[0] is el:
+                t.set("lvmcp_name", own[1])
+                t.set("lvmcp_dir", "in" if own[2] else "out")
+        self._typed_payload(cp)
+        inside = {e.get("uid") for e in node.iter() if e.get("uid")}
+        # the IMAGES it shows from the VI's DSIM block: the xNode's own `image` (its icon, a hex
+        # section index - 02 in Check Color Table Size.vi) and any positive ImageResID inside.
+        # Without them the composed VI loaded broken, "VI has an error of type 200" (2026-11-08)
+        want = set()
+        im = node.findtext("image")
+        if im and re.fullmatch(r"[0-9A-Fa-f]+", im.strip()):
+            want.add(int(im.strip(), 16))
+        for e in node.iter("ImageResID"):
+            try:
+                if int(e.text) > 0:
+                    want.add(int(e.text))
+            except (TypeError, ValueError):
+                pass
+        got = getattr(self, "xnode_images", {}).get(node.get("uid"), {})
+        if want and got:
+            imgs = ET.SubElement(cp, "lvmcpImages")
+            for idx, hx in sorted(got.items()):
+                if idx in want:
+                    ET.SubElement(imgs, "img", {"index": str(idx)}).text = hx
+        links = ET.SubElement(cp, "lvmcpLinks")
+        bd = ET.SubElement(links, "bd")
+        vi = ET.SubElement(links, "vi")
+        quals = set()
+        for rec in self.b.main.findall("LIbd/Section/BDHP/*"):
+            offs = [o.text for o in rec.findall("LinkOffsetList/Offset")]
+            uids = []
+            for o in offs:
+                try:
+                    uids.append(str(int(o, 16)))
+                except (TypeError, ValueError):
+                    pass
+            if uids and all(u in inside for u in uids):
+                bd.append(copy.deepcopy(rec))
+                quals.add(tuple(x.text for x in rec.findall("LinkSaveQualName/String")))
+        for rec in self.b.main.findall("LIvi/Section/LVIN/*"):
+            q = tuple(x.text for x in rec.findall("LinkSaveQualName/String"))
+            if q in quals and rec.tag in ("VIVI", "VIXN"):
+                r2 = copy.deepcopy(rec)
+                td = r2.find("TypeDesc")
+                if td is not None and td.get("TypeID") not in (None, "0"):
+                    td.append(self.b.tree(self.b.flat_of_consolidated(int(td.get("TypeID")))))
+                vi.append(r2)
+        return ET.tostring(cp, encoding="unicode")
+
+    def call(self, node, parent_uid):
+        """A subVI call: target from the diagram's link record naming this node, terminal names
+        from the LABELS of the terminal types (a call node's terminals carry the callee's
+        labelled pane types)."""
+        recs = self.call_targets.get(node.get("uid"), {})
+        link = node.find("dynLink")
+        if not recs and link is not None:
+            # a DYNAMIC DISPATCH call (dynIUse): its DyOM record names the dynLink child
+            recs = self.call_targets.get(link.get("uid"), {})
+        el = ET.Element("Call", {"uid": node.get("uid"), "uid_parent": parent_uid})
+        target = recs.get("PUPV") or recs.get("IUVI") or next(iter(recs.values()), None)
+        if target is None:
+            self.notes.append("call node %s: no link record names it" % node.get("uid"))
+            target = "?"
+        elif target.startswith("Instance:") and target[len("Instance:"):] in self.instance_names:
+            target = self.instance_names[target[len("Instance:"):]]    # an Express VI
+        if recs.get("PUPV") and recs.get("IUVI"):
+            # a polymorphic call: NI writes the polymorphic VI as target, the instance it
+            # adapted to as instance, and adapt="true" - but ONLY where the instance is chosen
+            # automatically: preferredInstIndex FF (296 of 296 over NI's examples); a number there
+            # is an instance the author FIXED, and NI writes no adapt (138 of 138, 2026-11-06)
+            # (a node with no preferredInstIndex at all is written without adapt too: 58 of 58)
+            pref = (node.findtext("preferredInstIndex") or "").strip().upper()
+            if pref == "FF":
+                el.set("adapt", "true")
+            el.set("instance", recs["IUVI"])
+        el.set("target", target)
+        slots = None
+        cpath = self.call_paths.get(node.get("uid")) or (self.call_paths.get(link.get("uid")) if link is not None else None)
+        disk, changes, seen = None, [], set()
+        cfile = None if target in self.instance_names.values() or target.lower().endswith(".vim") \
+            else self._checked_callee(cpath)
+        if cfile and not newer_than(cfile, self.vi_path):
+            # saved before this caller: its pane copy here is the current one
+            LINK_STATS["skippedByDate"].add(os.path.normcase(cfile))
+            cfile = None
+        elif cfile:
+            LINK_STATS["read"].add(os.path.normcase(cfile))
+            disk, why = callee_pane(cfile)
+            if disk is None:
+                self.subvi_findings[node.get("uid")] = (target, "unresolved", [
+                    "its file %s could not be read (%s): the terminals are the caller's copy" % (cfile, why)])
+        elif cpath is not None and self.vi_path and not target.lower().endswith(".vim") \
+                and self._checked_callee(cpath, exists=False):
+            self.subvi_findings[node.get("uid")] = (target, "unresolved", [
+                "its file was not found at %s: the terminals are the caller's copy" % link_target_text(cpath, self.vi_path)])
+        gained = []
+        if disk is not None:
+            # slots the callee GAINED, which the call shows unwired: listed IN SLOT ORDER among
+            # the call's own terminals, as NI's export lists them (Issue136SubVI's Caller.vi:
+            # `Sum:..,Status:,error out:..` for a Status added at slot 6, 2026-11-18)
+            present = {i for i, t in enumerate(node.find("termList"))
+                       if (lambda tt: tt is not None and tt.get("Type") != "Void")(self.tid_tree(t))}
+            gained = [i for i in sorted(disk) if i not in present]
+
+        def add_gained(below):
+            while gained and (below is None or gained[0] < below):
+                j = gained.pop(0)
+                lab, is_out, typ, _ = disk[j]
+                changes.append("new %s %r (%s)" % ("output" if is_out else "input", lab, typ))
+                self.term_owner["%s#slot%d" % (node.get("uid"), j)] = (el, lab, not is_out)
+        for i, term in enumerate(node.find("termList")):
+            d = term.find("dco")
+            tree = self.tid_tree(term)
+            if tree is None or tree.get("Type") == "Void":
+                continue
+            add_gained(i)
+            # a typedef'd terminal is labelled on the type it wraps (Read Plot Array.vi's `Plot
+            # Property Array` - the XControl sweep, 2026-10-22)
+            name = self._field_name(tree)
+            if not name:
+                # the link's pane type carries no label for this terminal: the CALLEE's own
+                # panel names it, by slot (the call's terms stand in pane order, Void for an
+                # unconnected slot) - Traverse for GObjects.vi's `Traverse Target`
+                if slots is None:
+                    f = link_file(self.call_paths.get(node.get("uid")) or
+                                  (self.call_paths.get(link.get("uid")) if link is not None else None), self.vi_path)
+                    slots = callee_slots(f) if f else {}
+                # an EMPTY label is a name too: lvStorage.llb's _L_localizedStrings.vi labels
+                # neither terminal, and NI's export writes them as ""
+                name = slots[i] if i in slots else "?"
+            out = int(d.findtext("objFlags") or 0) & 1
+            if disk is not None:
+                seen.add(i)
+                name = self._compare_slot(disk.get(i), name, bool(out), tree, changes)
+                if disk.get(i) is None:
+                    # a terminal the callee LOST: NI's export leaves it off the call and the wire
+                    # to it ends nowhere, as LabVIEW loads the caller - broken, `the type of the
+                    # sink is void` (Issue136SubVI's Caller.vi once Sub.vi lost X, 2026-11-18)
+                    self.term_owner[term.get("uid")] = IGNORED
+                    continue
+            self.term_owner[term.get("uid")] = (el, name, not out)
+        if disk is not None:
+            add_gained(None)
+            if changes:
+                self.subvi_findings[node.get("uid")] = (target, "drift", changes)
+        return el
+
+    def _checked_callee(self, path, exists=True):
+        """A call link's file when its pane is to be checked against the caller's copy: the
+        project's own code, a .vi or .vit. Not a callee in the LabVIEW installation (an anchored
+        `<vilib>`... path): NI keeps those panes stable, and checking them would read every vi.lib
+        VI an example calls - the cost of the check, not its point. With `exists` False: whether
+        the link is one to check at all, found or not."""
+        if not path or not path[1] or not self.vi_path:
+            return None
+        comps = path[1]
+        if comps[0].startswith("<") or not comps[-1].lower().endswith((".vi", ".vit")):
+            return None
+        if link_target_text(path, self.vi_path).lower().startswith(self.vi_path.lower() + os.sep):
+            # an instance saved INSIDE the caller - a malleable VI's: `Example of JOBJ Tag.vi`
+            # calling JSONtext's To JSON Text.vim links `<itself>\8c90...-...vi` (2026-11-18)
+            return None
+        if not exists:
+            return True
+        return link_file(path, self.vi_path)
+
+    @staticmethod
+    def _compare_slot(d, name, is_out, tree, changes):
+        """One call terminal against the callee's slot on disk; the name LabVIEW shows now."""
+        mine = aixml_type(tree) or lvheap.type_key(tree)
+        if d is None:
+            changes.append("%r is no longer on the callee's pane - left off the call; a wire to it "
+                           "breaks the caller, as LabVIEW loads it" % name)
+            return name
+        lab, d_out, typ, td = d
+        if d_out != is_out:
+            changes.append("%r is now an %s" % (lab, "output" if d_out else "input"))
+        if lab != name and not name.startswith("?"):
+            changes.append("%r is now named %r" % (name, lab))
+        if typ != mine and td is not None and td == typedef_name(tree):
+            # the TYPEDEF changed, and this VI's copy of it inside the callee's pane is stale
+            # (DQMH callers of Obtain Request Events.vi saved before the module's last event was
+            # added, 2026-11-18): LabVIEW updates such a wire, it does not break it
+            changes.append("%r carries typedef %s, which changed since this VI was saved" % (lab, td))
+        elif typ != mine:
+            changes.append("%r changed type from %s to %s - a wire to it may break" % (lab, mine, typ))
+        return lab
+
+    def loop(self, node, parent_uid):
+        cls = node.get("class")
+        # a TIMED LOOP is a While Loop's heap with timing terminals and data nodes besides: NI's
+        # export writes it `Timed Loop` with its count, Condition, tunnels and registers and none of
+        # the timing (2026-11-06)
+        el = ET.Element("Structure", {"_name": {"whileLoop": "While Loop", "timeLoop": "Timed Loop"}.get(cls, "For Loop"),
+                                      "uid": node.get("uid"), "uid_parent": parent_uid})
+        el.set("count", "")
+        if cls == "forLoop":
+            el.set("maxin", "")
+            el.set("maxout", "")
+            # iteration parallelism: a <ParForWorkers> names the P terminal's DCO, and
+            # ParForNumStaticWorkers (hex) is the number of generated instances
+            if node.find("ParForWorkers") is not None:
+                if not hasattr(self, "parallel_loops"):
+                    self.parallel_loops = []
+                self.parallel_loops.append((node.get("uid"), int(node.findtext("ParForNumStaticWorkers") or "0", 16)))
+        inner = node.find("diagramList/SL__arrayElement")
+        set_sublabel(el, inner)
+        srn = next((n for n in self.node_defs(inner) if n.get("class") == "sRN"), None) if inner is not None else None
+        inner_terms = {}
+        for t in (srn.find("termList") if srn is not None else []):
+            d = t.find("dco")
+            if d is not None and t.get("class") == "term":
+                inner_terms.setdefault(d.get("uid"), []).append(t)
+        # loop i and the stop condition are DCOs of the loop with a terminal inside
+        idx = node.find("loopIndexDCO")
+        if idx is not None:
+            for t in inner_terms.get(idx.get("uid"), []):
+                self.term_owner[t.get("uid")] = (el, "#count", False)
+        tst = node.find("loopTestDCO")
+        if tst is not None:
+            # value="stop" only for Stop if True: the lTst DCO carries 0x10000 then (objFlags 65537),
+            # and Continue if True clears it (objFlags 1) - where NI's exporter writes NO value at
+            # all. Measured 2026-10-15 on SB_WriteINIVal.vi, picktime.vi and Add Abstract Message
+            # to Actor.vi, all three objFlags 1 and value-less in NI's export, against 428 NI
+            # "stop" conditions; this wrote "stop" for every loop until then.
+            cond = ET.Element("Condition", {"uid": tst.get("uid"), "uid_parent": node.get("uid")})
+            if int(tst.findtext("objFlags") or 0) & LOOP_STOP_IF_TRUE:
+                cond.set("value", "stop")
+            for t in inner_terms.get(tst.get("uid"), []):
+                self.term_owner[t.get("uid")] = (cond, "value", True)
+            self._pending_children = getattr(self, "_pending_children", [])
+        n_in = n_out = 0
+        sr = []
+        children = []
+        rank = self._tunnel_ranks(node, "lpTun")
+        for term in node.find("termList"):
+            d = self.dco_def(term.find("dco"))
+            if d is None:
+                continue
+            dc = d.get("class")
+            if dc == "lpTun":
+                out = int(d.findtext("objFlags") or 0) & 1
+                if out:
+                    n_out += 1
+                else:
+                    n_in += 1
+                tun = ET.Element("Tunnel", {"_id": ("Out%d" % rank.get(term.get("uid"), n_out)) if out
+                                            else ("In%d" % rank.get(term.get("uid"), n_in)),
+                                            "uid": term.get("uid"), "uid_parent": node.get("uid")})
+                tt = (d.findtext("TunnelType") or "").strip()
+                if tt and tt.isalnum() and int(tt, 16) == 2 and d.find("innerLpTunDCO") is None:
+                    # a CONCATENATING output: no inner DCO, TunnelType 02 (the composer's own
+                    # finding, NI's TDMS example) - read as indexing it broke t117's round trip
+                    tun.set("mode", "concat")
+                elif d.find("innerLpTunDCO") is not None or tt:
+                    tun.set("mode", "index")
+                self.term_owner[term.get("uid")] = (tun, "value", not out)
+                for t in inner_terms.get(d.get("uid"), []):
+                    self.term_owner[t.get("uid")] = (tun, "value", bool(out))
+                inner_dco = d.find("innerLpTunDCO")
+                if inner_dco is not None:
+                    for t in inner_terms.get(inner_dco.get("uid"), []):
+                        self.term_owner[t.get("uid")] = (tun, "value", bool(out))
+                cdco = d.find("LpTunConditionDCO")
+                if cdco is not None:
+                    # a CONDITIONAL tunnel: the net wired into its condition terminal (inside)
+                    # becomes cond="<net>"
+                    for t in inner_terms.get(cdco.get("uid"), []):
+                        self.term_owner[t.get("uid")] = (tun, "#cond", True)
+                children.append(tun)
+            elif dc == "lTiming":
+                # a timing input or output of a Timed Loop: not in AIXML; SAID when wired (below)
+                self.term_owner[term.get("uid")] = IGNORED
+                self.event_timeouts = getattr(self, "event_timeouts", [])
+                self.event_timeouts.append((term.get("uid"), node.get("uid"), "Timed Loop"))
+            elif dc == "lMax":
+                self.term_owner[term.get("uid")] = (el, "#maxin", True)
+                for t in inner_terms.get(d.get("uid"), []):
+                    self.term_owner[t.get("uid")] = (el, "#maxout", False)
+            elif dc == "rSR":
+                sr.append((term, d))
+        by_dco = {t.find("dco").get("uid"): t for t in node.find("termList") if t.find("dco") is not None}
+        for term, d in sr:
+            reg = ET.Element("ShiftReg", {"uid": d.get("uid"), "uid_parent": node.get("uid")})
+            # the register's TYPE, after </VI> (`srtype`): an UNINITIALIZED one takes it from the
+            # wire inside the loop, which the composer cannot type before the loop's own diagram
+            # (the 2D Math Plots' facades keep their state that way)
+            st = aixml_type(self.tid_tree(term))
+            if st:
+                self.sr_types = getattr(self, "sr_types", [])
+                self.sr_types.append((reg, st))
+            lefts = [x.get("uid") for x in d.findall("lsrDCOList/SL__arrayElement")]
+            # ONE Left for all elements of a stacked register (NI: inputs value,value,value -
+            # the initializers - and outputs value,value,value - element 0 first, as the rSR's
+            # lsrDCOList lists them), each position kept even when unwired
+            left = ET.SubElement(reg, "Left", {"uid": lefts[0] if lefts else d.get("uid"), "uid_parent": d.get("uid")})
+            l_ins, l_outs = [], []
+            for k, lu in enumerate(lefts):
+                lterm = by_dco.get(lu)
+                if lterm is not None:
+                    self.term_owner[lterm.get("uid")] = (left, "value", True)
+                    l_ins.append((lterm.get("uid"), "value"))
+                for t in inner_terms.get(lu, [])[:1]:
+                    self.term_owner[t.get("uid")] = (left, "value", False)
+                    l_outs.append((t.get("uid"), "value"))
+            self.ordered_ports.append((left, "inputs", l_ins))
+            self.ordered_ports.append((left, "outputs", l_outs))
+            rin = inner_terms.get(d.get("uid"), [])
+            right = ET.SubElement(reg, "Right", {"uid": rin[0].get("uid") if rin else d.get("uid"),
+                                                 "uid_parent": d.get("uid")})
+            for t in rin:
+                self.term_owner[t.get("uid")] = (right, "value", True)
+            self.term_owner[term.get("uid")] = (right, "value", False)
+            children.append(reg)
+        if inner is not None:
+            self.walk(inner, node.get("uid"), el)
+        for c in children:
+            el.append(c)
+        if tst is not None:
+            el.append(cond)
+        return el
+
+    EVENT_KINDS = {1073741826: "Value Change", 1073741825: "Timeout", -2147483645: "Panel Close?",
+                   1073741839: "Mouse Enter", 1073741838: "Mouse Leave", 1000: "User Event"}
+    _event_kinds = None
+
+    @classmethod
+    def event_kinds(cls):
+        """EventSpec type -> event name: the six above plus every STATIC event the composer knows
+        (parts/static-events.json, one type number per name - no two rows share one). Until
+        2026-10-11 the reader had only the six, so every mouse, key and graph event read back as
+        '?' - NI's Graph Events.vi as six of them in one frame."""
+        if cls._event_kinds is None:
+            kinds = dict(cls.EVENT_KINDS)
+            p = os.path.join(aixml2vi.OWN_PARTS, "static-events.json")
+            if os.path.exists(p):
+                with open(p, encoding="utf-8") as f:
+                    for name, row in json.load(f).items():
+                        spec = row.get("spec") if isinstance(row, dict) else None
+                        if spec and spec.get("type"):
+                            kinds.setdefault(int(spec["type"]), name)
+            # and the numbers the installation scan found in LabVIEW's own VIs, named by NI's
+            # exporter (scan_static_specs.py, name_static_specs.py) - events the composer cannot
+            # write yet (Mouse Down?, Drag Over, Pane Size, ...) but the reader can name
+            p = os.path.join(aixml2vi.OWN_PARTS, "event-type-names.json")
+            if os.path.exists(p):
+                with open(p, encoding="utf-8") as f:
+                    for typ, row in json.load(f).items():
+                        kinds.setdefault(int(typ), row["name"])
+            cls._event_kinds = kinds
+        return cls._event_kinds
+
+    def nested_by_ddo(self):
+        """uid -> label of every labelled data object of the panel that is not a control of its
+        own (a cluster's field, an array inside a cluster)."""
+        if getattr(self, "_nested", None) is None:
+            self._nested = {}
+            parent = {c: p for p in self.b.fp.iter() for c in p}
+
+            def own_label(x):
+                pl = x.find("partsList")
+                for part in pl if pl is not None else []:
+                    if part.get("class") == "label" and part.findtext("partID") == "16" and part.findtext("textRec/text"):
+                        lab = lvheap.pylv_to_text(unquote(part.findtext("textRec/text")).replace("&#x00;", "").strip())
+                        return lab if lab and lab != "[NULL]" else None
+                return None
+            for e in self.b.fp.iter():
+                uid, cls = e.get("uid"), e.get("class")
+                if not uid or not cls or cls in ("label", "cosm", "pane", "fPDCO", "Image", "textHair") or uid in self.ctl_by_ddo:
+                    continue
+                lab = own_label(e)
+                if not lab:
+                    continue
+                # NI's export names it by its PATH from the control that holds it -
+                # `"Customized Plot Legend.Color Pair Array": Mouse Down` (2D Error Bar facade)
+                path, x = [lab], e
+                while x in parent:
+                    x = parent[x]
+                    if x.get("uid") in self.ctl_by_ddo:
+                        path.insert(0, label_of(self.ctl_by_ddo[x.get("uid")].get("_name")).strip())
+                        break
+                    if x.get("class") not in (None, "pane", "fPDCO") and x.tag in ("ddo", "SL__arrayElement") and own_label(x):
+                        path.insert(0, own_label(x))
+                self._nested[uid] = ".".join(path)
+        return self._nested
+
+    @staticmethod
+    def _listbox_strings(ddo):
+        """A listbox's ITEM STRINGS and COLUMN HEADERS, which AIXML has no place for: [sizes,
+        items, headers] - NI's 3D Graph prop_axes_main.vi lists X-Axis, Y-Axis, Z-Axis there.
+        A [NULL] entry is a string LabVIEW never set."""
+        def strs(parent):
+            out = []
+            for x in parent if parent is not None else []:
+                t = x.text or ""
+                out.append(None if t == "[NULL]" else unquote(t))
+            return out
+        base = ddo.find("baseListboxItemStrings")
+        sz = base.find("multiDimArraySizes") if base is not None else None
+        sizes = [int(x.text) for x in sz] if sz is not None else []
+        items = strs(base.find("multiDimArrayElems")) if base is not None else []
+        return [sizes, items, strs(ddo.find("columnHeaders"))]
+
+    def _implicit_link(self, ddo):
+        """The `link=` of an IMPLICIT property or invoke node: the label of the front-panel object
+        its <ddo> names - or of the PANE, which NI's export writes as link="Pane" (its label, the
+        default when it has none) - prop_action_buttons.vi's `write+Origin`, 2026-10-23."""
+        if ddo is None or not ddo.get("uid"):
+            return None
+        if ddo.get("uid") in self.ctl_by_ddo:
+            return label_of(self.ctl_by_ddo[ddo.get("uid")].get("_name"))
+        if ddo.get("uid") in self.subpanels():
+            return self.subpanels()[ddo.get("uid")][0]
+        if any(e.get("uid") == ddo.get("uid") and e.get("class") == "pane" for e in self.b.fp.iter()):
+            return self.panes_by_ddo().get(ddo.get("uid"), "Pane")
+        return None
+
+    def subpanels(self):
+        """uid -> (label, bounds) of every SUB PANEL of the front panel: a stdSubPanel object in
+        a grouper, no fPDCO and no data, so AIXML has no element for it - NI's export names it
+        only in its implicit nodes' link=. The bounds are the grouper's, in its pane."""
+        if getattr(self, "_subpanels", None) is None:
+            self._subpanels = {}
+            for g in self.b.fp.iter("SL__arrayElement"):
+                pl = g.find("partsList")
+                if g.get("class") != "grouper" or pl is None:
+                    continue
+                for sp in pl:
+                    if sp.get("class") != "stdSubPanel" or not sp.get("uid"):
+                        continue
+                    lab = next((lvheap.pylv_to_text(unquote(p.findtext("textRec/text") or "").replace("&#x00;", "").strip())
+                                for p in (sp.find("partsList") if sp.find("partsList") is not None else [])
+                                if p.get("class") == "label"), "") or "Subpanel"
+                    self._subpanels[sp.get("uid")] = (lab, g.findtext("bounds") or "")
+        return self._subpanels
+
+    def panes_by_ddo(self):
+        """uid -> label of every PANE of the front panel (paneHierarchy, a splitter's panes)."""
+        if getattr(self, "_panes", None) is None:
+            self._panes = {}
+            for e in self.b.fp.iter():
+                if e.get("class") == "pane" and e.get("uid"):
+                    for part in e.find("partsList") if e.find("partsList") is not None else []:
+                        if part.get("class") == "label" and part.findtext("textRec/text"):
+                            lab = lvheap.pylv_to_text(unquote(part.findtext("textRec/text")).replace("&#x00;", "").strip())
+                            if lab and lab != "[NULL]":
+                                self._panes[e.get("uid")] = lab
+                            break
+        return self._panes
+
+    def event_selectors(self, node, n):
+        """Frame index -> the AIXML selector of an Event Structure frame, from its EventSpecs:
+        ' "Stop": Value Change ', ' Timeout ', ' Panel Close? '."""
+        items = {i: [] for i in range(n)}
+        # a DYNAMIC event's source is the registration's child its EventSpec's dynIndex (1-based)
+        # points at, named by that child's label in angle brackets: `<Tick>: User Event`,
+        # `<File>: Mouse Down`, `<Actor.Stopped>: User Event` - the registration is the type of
+        # the structure's dynamic event terminal
+        dyn = []
+        for t in node.find("termList"):
+            d = t.find("dco")
+            if d is not None and d.get("class") == "eventDynDCO":
+                tree = self.tid_tree(t)
+                regs = None
+                if tree is not None and tree.get("RefType") == "EventReg":
+                    regs = [(tree, "")]
+                elif tree is not None and tree.get("Type") == "Cluster":
+                    # a CLUSTER of registrations bundled into the one dynamic terminal: each is
+                    # named by its own label before the path, the registrations themselves taking
+                    # no index - `<Pnl Actor.Actor.Stopped>`, `<Event Registration Refnum.New ID>`
+                    # (MGI's Panel Manager, the Event Messenger lessons, 2026-11-06)
+                    regs = [(c, (c.get("Label") or "") + ".") for c in tree if c.tag == "TypeDesc"
+                            and c.get("RefType") == "EventReg"]
+                if regs:
+                    # dynIndex counts the registration in PREORDER: a CLUSTER of event refnums
+                    # (a typedef'd one too) is one index and each of its children the next, named
+                    # by their path - `<Wait User Events.Stop>`, `<Actor.Stopped>`, DQMH's
+                    # `<... Broadcast Events.X>`; read flat, 63 frames over NI's shipping examples
+                    # said only ` User Event ` (2026-11-06)
+                    def flat(children, prefix):
+                        out = []
+                        for c in children:
+                            inner = c
+                            while inner.get("Type") == "TypeDef" and inner.find("TypeDesc") is not None:
+                                inner = inner.find("TypeDesc")
+                            # an UNLABELLED source is `#n`, its index (Dynamic Event Generation.vi)
+                            label = c.get("Label") or inner.get("Label") or "#%d" % (len(dyn_all) + len(out) + 1)
+                            out.append(prefix + label)
+                            if inner.get("Type") == "Cluster":
+                                out += flat([x for x in inner if x.tag == "TypeDesc"], prefix + label + ".")
+                        return out
+                    dyn_all = []
+                    for reg, prefix in regs:
+                        dyn_all += flat(aixml2vi.fields(reg), prefix)
+                    dyn = dyn_all
+                    break
+        if node.find("EventNodeEvents") is None:
+            # a file from before LabVIEW 2009 SP1 or so keeps the registrations out of the heap,
+            # like its constants' values (MGI's Configure Dialog.vi, a LabVIEW 9.0 file)
+            self.notes.append("Event Structure %s: no EventNodeEvents in the heap (an old file keeps its "
+                              "registrations in compiled code) - its frames name no event" % node.get("uid"))
+        for sp in node.findall("EventNodeEvents/SL__arrayElement"):
+            di = int(sp.findtext("diagramIdx") or 0)
+            kind = self.event_kinds().get(int(sp.findtext("type") or 0), "?")
+            ddo = sp.findtext("ddoUID") or "0"
+            ctl = self.ctl_by_ddo.get(ddo) if ddo != "0" else None
+            # NI's selector names a control TRIMMED: `"Stop Button"` for a label padded with blanks
+            src = '"%s"' % label_of(ctl.get("_name")).strip() if ctl is not None else None
+            if src is None and ddo != "0" and ddo in self.panes_by_ddo():
+                # a PANE's event, named by the pane's label as NI writes it (`"Pane": Mouse Up`,
+                # `"Tree pane": Pane Size`) - the 3D Math Plots' facades handle the panel pane's
+                # Shortcut Menu Activation? (the XControl sweep, 2026-10-22)
+                src = '"%s"' % self.panes_by_ddo()[ddo]
+            if src is None and ddo != "0" and ddo in self.nested_by_ddo():
+                # an object INSIDE a control - the 2D Math Plots' facades handle Mouse Down on the
+                # `Color Pair Array` of their legend cluster - named by its own label
+                src = '"%s"' % self.nested_by_ddo()[ddo]
+            k = int(sp.findtext("dynIndex") or 0)
+            if src is None and 0 < k <= len(dyn) and dyn[k - 1]:
+                src = "<%s>" % dyn[k - 1]
+            lst = items.setdefault(di, [])
+            if src and lst and lst[-1][1] == kind and lst[-1][0]:
+                # the same event on the next control: ONE item listing its sources, as NI writes
+                # it (' "Numeric Control", "Stop", "Waveform": Mouse Enter ', Handling Mouse
+                # Events.vi) and aixml2vi.event_items reads it
+                lst[-1][0].append(src)
+            else:
+                lst.append(([src] if src else [], kind))
+        # events are separated by ';' as NI's exporter writes them - a ',' separates SOURCES of
+        # one event (aixml2vi.event_items), so joining with ',' made NI's Graph Events.vi frame
+        # read back as one source list ending in 'Autoscale Range Change: Cursor Release'
+        # ...and ';' with TWO spaces after it (Graph Events.vi, `t125`'s user events)
+        # ESCAPED as NI writes a selector: ':' is \3A and ',' is \2C, ';' stays raw - counted over
+        # the cached exports, 443 Value Change selectors and every one `"Search"\3A Value Change`.
+        # This wrote them raw until 2026-10-15, and lvai_graft_diagram's EventFrames, which matches
+        # NI's `\3A`, then found NO frame on the pylabview backend, skipped the re-registration and
+        # left the grafted VI eBad ("one or more event cases have no events defined").
+        return {i: escape_description(" %s " % ";  ".join(("%s: %s" % (", ".join(src), kind)) if src else kind
+                                                          for src, kind in v))
+                for i, v in items.items()}
+
+    def case(self, node, parent_uid, event=False):
+        el = ET.Element("Structure", {"_name": "Event Structure" if event else "Case Structure",
+                                      "uid": node.get("uid"), "uid_parent": parent_uid})
+        if not event:
+            el.set("selectin", "")
+        frames = list(node.find("diagramList"))
+        frame_srn_terms = []
+        for fr in frames:
+            srn = next((n for n in self.node_defs(fr) if n.get("class") == "sRN"), None)
+            ts = {}
+            for t in (srn.find("termList") if srn is not None else []):
+                d = t.find("dco")
+                if d is not None and t.get("class") == "term":
+                    ts.setdefault(d.get("uid"), []).append(t)
+            frame_srn_terms.append(ts)
+        sel_strings = [lvheap.value_text(bytes.fromhex(x.text)) if x.text else ""
+                       for x in node.findall("SelectStringArray/SL__arrayElement")]
+        sel_tree = None
+        frame_els = []
+        for i, fr in enumerate(frames):
+            attrs = {"selector": "", "uid": fr.get("uid"), "uid_parent": node.get("uid")}
+            if not event:
+                attrs["selectout"] = ""
+            frame_els.append(ET.Element("CaseFrame", attrs))
+            set_sublabel(frame_els[-1], fr)
+        n_in = n_out = 0
+        outer_tunnels = []
+        rank = self._tunnel_ranks(node, "selTun")
+        for term in node.find("termList"):
+            d = self.dco_def(term.find("dco"))
+            if d is None:
+                continue
+            dc = d.get("class")
+            if dc == "eventDynDCO":
+                # the dynamic event terminals: no AIXML terminal, so their wire ends are dropped -
+                # but which net feeds the LEFT one is written after </VI> (`dynreg`), for a
+                # registration that reaches the structure with no tunnel of its own
+                self.term_owner[term.get("uid")] = IGNORED
+                if not int(d.findtext("objFlags") or 0) & 1:
+                    self.dyn_terms = getattr(self, "dyn_terms", {})
+                    self.dyn_terms[term.get("uid")] = el
+                for ts in frame_srn_terms:
+                    for t in ts.get(d.get("uid"), []):
+                        self.term_owner[t.get("uid")] = IGNORED
+                continue
+            if dc == "eventTimeOut":
+                # the TIMEOUT input. NI's export carries no attribute for it (154 of 154 Event
+                # Structures) and drops that wire end; this reader writes it as `timeoutin="<net>"`,
+                # like a Case Structure's `selectin`, which the composer wires (2026-11-19). Until
+                # then the end was dropped and SAID, so the composer refused the export
+                self.term_owner[term.get("uid")] = (el, "#timeoutin", True)
+                continue
+            if dc == "caseSel":
+                # SNAPSHOT: the frames' selector values are item NUMBERS of the type as saved
+                sel_tree = self.tid_tree(term, snapshot=True)
+                self.term_owner[term.get("uid")] = (el, "#selectin", True)
+                for i, ts in enumerate(frame_srn_terms):
+                    for t in ts.get(d.get("uid"), []):
+                        self.term_owner[t.get("uid")] = (frame_els[i], "#selectout", False)
+            elif dc == "selTun":
+                f = int(d.findtext("objFlags") or 0)
+                out = f & 1
+                if out:
+                    n_out += 1
+                else:
+                    n_in += 1
+                tid = ("Out%d" % rank.get(term.get("uid"), n_out)) if out else ("In%d" % rank.get(term.get("uid"), n_in))
+                tun = ET.Element("Tunnel", {"_id": tid, "uid": term.get("uid"), "uid_parent": node.get("uid")})
+                if f & 0x200000:
+                    # cond="true" is the 0x200000 bit, on input and output tunnels alike
+                    tun.set("cond", "true")
+                self.term_owner[term.get("uid")] = (tun, "value", not out)
+                outer_tunnels.append(tun)
+                for i, ts in enumerate(frame_srn_terms):
+                    for t in ts.get(d.get("uid"), []):
+                        half = ET.Element("Tunnel", {"_id": tid, "uid": t.get("uid"), "uid_parent": frames[i].get("uid")})
+                        self.term_owner[t.get("uid")] = (half, "value", bool(out))
+                        frame_els[i].append(half)
+        # selectors
+        items = {i: [] for i in range(len(frames))}
+        while sel_tree is not None and sel_tree.get("Type") == "TypeDef" and sel_tree.find("TypeDesc") is not None:
+            # a typedef'd enum (State Machine Fundamentals' States): its items are inside, and read
+            # off the wrapper alone the frames came out numbered "2", "3" where NI writes the items
+            sel_tree = sel_tree.find("TypeDesc")
+        st = (sel_tree.get("Type") if sel_tree is not None else "") or ""
+        labels = [e.text or "" for e in sel_tree.findall("EnumLabel")] if sel_tree is not None else []
+        ranges = node.findall("SelectRangeArray32/SL__arrayElement")
+        # an ERROR case has two encodings (error_case_survey.py over 73 VIs, no exception): on the
+        # STATUS - ranges 0 and 1, "No Error" / "Error" - and on the CODE, marked by INT_MIN or
+        # INT_MAX somewhere: "No Error" is INT_MIN..INT_MIN, "Error .." INT_MIN..INT_MAX open at
+        # both ends, "Error 1..5" a closed range, "Error 6, 10, 20" three single codes with the
+        # prefix written ONCE (Case Structure - Selector Data Types.vi)
+        on_code = any(int(r.findtext(k) or 0) in (INT_MIN, INT_MAX) for r in ranges for k in ("start", "end"))
+        code_items = {}
+        for r in ranges:
+            di = int(r.findtext("diagramIdx") or 0)
+            s, e = int(r.findtext("start") or 0), int(r.findtext("end") or 0)
+            stt, ett = int(r.findtext("startRangeType") or 0), int(r.findtext("endRangeType") or 0)
+            if st == "Boolean":
+                txt = "True" if s else "False"
+            elif st == "Cluster":
+                if (on_code and e == INT_MIN) or (not on_code and stt == ett == 0 and s == e == 0):
+                    txt = "No Error"
+                elif not on_code and stt == ett == 0 and s == e == 1:
+                    txt = "Error"
+                else:
+                    code_items.setdefault(di, []).append(
+                        str(s) if stt == ett == 0 else "%s..%s" % (str(s) if stt != 3 else "", str(e) if ett != 3 else ""))
+                    continue
+            else:
+                def val(v):
+                    if st == "String":
+                        return '"%s"' % esc_case_text(sel_strings[v]) if 0 <= v < len(sel_strings) else str(v)
+                    if labels:
+                        # QUOTED, as NI's exporter writes an enum item (`"State 1"`, t97)
+                        return '"%s"' % esc_case_text(labels[v]) if 0 <= v < len(labels) else str(v)
+                    return str(v)
+                if stt == 0 and ett == 0:
+                    txt = val(s)
+                elif stt != 3 and ett != 3 and e == s + 1:
+                    # a closed range of exactly TWO values is two items in NI's export - `"Bad",
+                    # "Idle"`, `-2, -1` (15 frames over NI's shipping examples) - while three or
+                    # more stay a range, `"Option 2".."Option 4"`, `4..9` (2026-11-06)
+                    items.setdefault(di, []).append(val(s))
+                    txt = val(e)
+                else:
+                    txt = "%s..%s" % (val(s) if stt != 3 else "", val(e) if ett != 3 else "")
+            items.setdefault(di, []).append(txt)
+        for di, ci in code_items.items():
+            items.setdefault(di, []).extend(["Error " + ci[0]] + ci[1:])
+        if st == "Cluster" and not ranges and len(frames) == 2:
+            # an ERROR case may carry no range list either (MGI's Store.vi). It decides on the
+            # STATUS, so it reads like a boolean case without one (OpenG's Message and Response
+            # Example.vi, below): frame 0 is No Error, frame 1 Error. Read as no selector at all,
+            # the composer refused "an integer case on a Cluster wire" (2026-10-22). dIdx is no
+            # help - Store.vi's reads 11 for two frames.
+            items[0], items[1] = ["No Error"], ["Error"]
+        if st == "Boolean" and not ranges and len(frames) == 2:
+            # a boolean case may carry NO range list at all: frame 0 is False, frame 1 True in
+            # NI's export (OpenG's Message and Response Example.vi)
+            items[0], items[1] = ["False"], ["True"]
+        if not event and not ranges and st not in ("Boolean", "Cluster") and len(frames) > 2:
+            # a LabVIEW 9.0 file keeps NO range list in its heap: MGI's Handle Event.vi (vers
+            # 9.0.0) has six enum frames and no SelectRangeArray anywhere, while NI's exporter,
+            # reading the loaded VI, names every one ("Timeout", "Value Change", ...). Its other
+            # frames come out with an empty selector and the composed VI is broken - said here,
+            # not guessed (2026-10-23)
+            self.notes.append("case structure %s: the file stores no selector values (a LabVIEW 9.0 "
+                              "heap?) - frames other than the default have an empty selector" % node.get("uid"))
+        dflt = node.findtext("SelectDefaultCase")
+        if dflt is None and st not in ("Boolean", "Cluster"):
+            # ABSENT means frame 0: LabVIEW writes 01, 02, 03 or FF (no default) and never 00 -
+            # NI's Simple Dual Mode Thermometer Facade.vi has none, NI's export calls its frame 0
+            # "Default", and read as "no default" the string case composed without one and broke
+            # the VI (2026-10-11)
+            dflt = "00"
+        if dflt:
+            try:
+                di = int(dflt, 16)
+                if di != 0xFF:
+                    items.setdefault(di, []).append("Default")
+            except ValueError:
+                pass
+        ev = self.event_selectors(node, len(frames)) if event else None
+        for i, f in enumerate(frame_els):
+            f.set("selector", ev.get(i, " ? ") if event else esc_attr_items(items.get(i, [])))
+        for t in outer_tunnels:
+            if t.get("_id").startswith("In"):
+                el.append(t)
+        for i, fr in enumerate(frames):
+            self.walk(fr, fr.get("uid"), frame_els[i])
+            el.append(frame_els[i])
+        for t in outer_tunnels:
+            if t.get("_id").startswith("Out"):
+                el.append(t)
+        return el
+
+    def stackedseq(self, node, parent_uid):
+        """A STACKED SEQUENCE, frame by frame - NI's export writes ONE Structure with every
+        frame's content in it and no frames, which loses the order (Read RSS Feed.vi). Ours, as a
+        Case Structure is written: one <Diagram> per frame in order; each seqTun a <Tunnel> on the
+        structure (its uid the OUTER terminal, `_id` In<n>/Out<n>) plus one half per frame inside
+        that frame's <Diagram> (same `_id`, its uid the frame's inner terminal); each SEQUENCE
+        LOCAL (an sLoc in seqLocDCOList) only as halves, `_id` Local<n>, the frame that writes it a
+        sink (term objFlags 0x8000), every other frame a source. aixml2vi.add_stacked builds it
+        back (2026-11-08)."""
+        el = ET.Element("Structure", {"_name": "Stacked Sequence Structure", "uid": node.get("uid"),
+                                      "uid_parent": parent_uid})
+        frames = list(node.find("diagramList")) if node.find("diagramList") is not None else []
+        frame_of = {}
+        for fr in frames:
+            srn = next((n for n in self.node_defs(fr) if n.get("class") == "sRN"), None)
+            for t in (srn.find("termList") if srn is not None else []):
+                frame_of[t.get("uid")] = fr.get("uid")
+        halves = {fr.get("uid"): [] for fr in frames}
+        tunnels = []
+        n_in = n_out = 0
+        for term in (node.find("termList") if node.find("termList") is not None else []):
+            d = self.dco_def(term.find("dco"))
+            if d is None or d.get("class") != "seqTun":
+                continue
+            out = int(d.findtext("objFlags") or 0) & 1
+            if out:
+                n_out += 1
+            else:
+                n_in += 1
+            tid = ("Out%d" % n_out) if out else ("In%d" % n_in)
+            tun = ET.Element("Tunnel", {"_id": tid, "uid": term.get("uid"), "uid_parent": node.get("uid")})
+            self.term_owner[term.get("uid")] = (tun, "value", not out)
+            tunnels.append(tun)
+            for x in (d.find("termList") if d.find("termList") is not None else []):
+                fu = frame_of.get(x.get("uid"))
+                if fu is None:
+                    continue
+                half = ET.Element("Tunnel", {"_id": tid, "uid": x.get("uid"), "uid_parent": fu})
+                self.term_owner[x.get("uid")] = (half, "value", bool(out))
+                halves[fu].append(half)
+        locs = node.find("seqLocDCOList")
+        flags = {}
+        for fr in frames:
+            srn = next((n for n in self.node_defs(fr) if n.get("class") == "sRN"), None)
+            for t in (srn.find("termList") if srn is not None else []):
+                flags[t.get("uid")] = int(t.findtext("objFlags") or 0)
+        for k, loc in enumerate(locs if locs is not None else []):
+            loc = self.dco_def(loc) if loc.find("termList") is None else loc
+            if loc is None or loc.find("termList") is None:
+                continue
+            for x in loc.find("termList"):
+                fu = frame_of.get(x.get("uid"))
+                if fu is None:
+                    continue
+                half = ET.Element("Tunnel", {"_id": "Local%d" % (k + 1), "uid": x.get("uid"), "uid_parent": fu})
+                self.term_owner[x.get("uid")] = (half, "value", bool(flags.get(x.get("uid"), 0) & 0x8000))
+                halves[fu].append(half)
+        for fr in frames:
+            d_el = ET.SubElement(el, "Diagram", {"uid": fr.get("uid"), "uid_parent": node.get("uid")})
+            set_sublabel(d_el, fr)
+            self.walk(fr, fr.get("uid"), d_el)
+            for h in halves[fr.get("uid")]:
+                d_el.append(h)
+        for t in tunnels:
+            el.append(t)
+        return el
+
+    def flatseq(self, node, parent_uid):
+        """A Flat Sequence: one Structure ("Flat Sequence Frame") holding one Diagram per frame,
+        each frame's seqTun tunnels inside its Diagram with both sides on one element."""
+        el = ET.Element("Structure", {"_name": "Flat Sequence Frame", "uid": node.get("uid"), "uid_parent": parent_uid})
+        seql = node.find("sequenceList")
+        frames_ = list(seql) if seql is not None else []
+        for fr in frames_:
+            diag = fr.find("diagramList/SL__arrayElement")
+            if diag is None:
+                continue
+            if len(frames_) == 1:
+                # ONE frame: NI writes no <Diagram>, the frame's content sits on the structure itself
+                # (Simple Serial.vi), which aixml2vi's seq_frame reads as the frame
+                d_el, owner = el, node.get("uid")
+            else:
+                d_el = ET.SubElement(el, "Diagram", {"uid": diag.get("uid"), "uid_parent": node.get("uid")})
+                owner = diag.get("uid")
+            set_sublabel(d_el, diag)
+            srn = next((n for n in self.node_defs(diag) if n.get("class") == "sRN"), None)
+            inner = {}
+            for t in (srn.find("termList") if srn is not None else []):
+                d = t.find("dco")
+                if d is not None:
+                    inner.setdefault(d.get("uid"), []).append(t)
+            n_in = n_out = 0
+            tunnels = []
+            for term in (fr.find("termList") if fr.find("termList") is not None else []):
+                d = term.find("dco")
+                # seqTun: a tunnel to the OUTSIDE; flatSeqTun: one from frame to frame - its out
+                # half on frame k, its in half (0x200800) on frame k+1, joined by a wire on the
+                # diagram around the sequence (VI Execution Properties.vi: 9 of them were missing)
+                if d is None or d.get("class") not in ("seqTun", "flatSeqTun"):
+                    continue
+                out = int(d.findtext("objFlags") or 0) & 1
+                if out:
+                    n_out += 1
+                else:
+                    n_in += 1
+                tun = ET.Element("Tunnel", {"_id": ("Out%d" % n_out) if out else ("In%d" % n_in),
+                                            "uid": term.get("uid"), "uid_parent": owner})
+                self.term_owner[term.get("uid")] = (tun, "value", not out)
+                for t in inner.get(d.get("uid"), []):
+                    self.term_owner[t.get("uid")] = (tun, "value", bool(out))
+                tunnels.append(tun)
+            self.walk(diag, owner, d_el)
+            for t in tunnels:
+                d_el.append(t)
+        return el
+
+    def _inplace_array_pair(self, el, node, l, r, outer):
+        """An Array Index / Replace Elements pair, as NI's export writes it (Channel
+        Probe_Background Updater.vi): the left node `inputs="array:..,index:.."
+        outputs="element:.."`, the right one naming it in _id, `inputs="element:.."
+        outputs="array:..,index:.."`. In the heap two decomposeArrayNodes joined by an
+        arrayPoserInterface; each has [array, element, index] terms - the element one the
+        dcoAgg, inside the structure; array and index reach OUTSIDE through the structure's
+        terms, which name their DCO (left: array 0x800000, index 0xE00000; right 0x800001,
+        0xE00001)."""
+        left = ET.SubElement(el, "Node", {"_name": "Array Index / Replace Elements", "uid": l.get("uid"),
+                                          "uid_parent": node.get("uid")})
+        right = ET.Element("Node", {"_id": l.get("uid"), "_name": "Array Index / Replace Elements",
+                                    "uid": r.get("uid"), "uid_parent": node.get("uid")})
+        for half, sink_outer in ((l, True), (r, False)):
+            owner = left if half is l else right
+            agg = half.findtext("dcoAgg") or (half.find("dcoAgg").get("uid") if half.find("dcoAgg") is not None else None)
+            for t in half.find("termList"):
+                d = t.find("dco")
+                if d is None:
+                    continue
+                if d.get("uid") == agg:
+                    self.term_owner[t.get("uid")] = (owner, "element", not sink_outer)
+                    continue
+                f = int(d.findtext("objFlags") or 0)
+                # the array 0x800000; an index adds its dimension bits - both on a 1D array's
+                # (0xE00000), 0x200000 the row and 0x400000 the column of a 2D one (NI's Queue
+                # Stack Maze Solver.vi), which NI's export names `index (row)` / `index (col)`
+                role = {0x600000: "index", 0x200000: "index (row)", 0x400000: "index (col)"}.get(f & 0x600000, "array")
+                o = outer.get(d.get("uid"))
+                if o is not None:
+                    self.term_owner[o.get("uid")] = (owner, role, sink_outer)
+                else:
+                    # an INNER term that is not the aggregate: the element of a further index
+                    # group (`element, element` - NI's Bubble Sort Person Array Using Channel
+                    # Closure.vi swaps two elements, the second dropped with its wires until
+                    # 2026-11-06)
+                    self.term_owner[t.get("uid")] = (owner, "element", not sink_outer)
+        return right
+
+    # In Place pairs whose terminals NI names BY POSITION in the node's termList - left half, right
+    # half - each term outer (the structure's edge) or inner. Measured on NI's exports of its
+    # Variant Attribute Lookup Table, Map Collection and Tab-Delimited examples (2026-11-06); not
+    # read at all before, with every wire through them lost
+    INPLACE_NAMED = {
+        "arraySplitPoserInterface": ("Array Split / Replace Subarrays",
+                                     ["array", "element", "split length", "element"],
+                                     ["array", "element", "split length", "element"]),
+        "Class0180": ("Variant Attribute Get / Replace",
+                      ["variant", "attribute", "attribute name", "found?"],
+                      ["variant", "attribute", "attribute name", "found?"]),
+        "Class018F": ("Map Get / Replace Value",
+                      ["map", "value", "key", "key not found?", "default value"],
+                      ["map", "value", "key", "key not found?", "action"]),
+        "variantPoserInterface": ("Variant To / From Element", None, None),
+    }
+
+    def _inplace_named_pair(self, el, node, l, r, outer, poser_class):
+        """One of INPLACE_NAMED: the left node (no _id) and the right naming it in _id, each term
+        registered on the structure's OUTER terminal where its DCO reaches the edge, else on the
+        node's own. Variant To / From Element names by TYPE instead: the variant `Variant`, the error
+        cluster `error out`, the left's other outer input `type`, an inner end `data`."""
+        name, lnames, rnames = self.INPLACE_NAMED[poser_class]
+        left = ET.SubElement(el, "Node", {"_name": name, "uid": l.get("uid"), "uid_parent": node.get("uid")})
+        right = ET.Element("Node", {"_id": l.get("uid"), "_name": name, "uid": r.get("uid"),
+                                    "uid_parent": node.get("uid")})
+        for half, owner, names, sink_outer in ((l, left, lnames, True), (r, right, rnames, False)):
+            for i, t in enumerate(half.find("termList")):
+                d = t.find("dco")
+                if d is None:
+                    continue
+                o = outer.get(d.get("uid"))
+                if names is None:
+                    tree = self.tid_tree(t)
+                    typ = tree.get("Type") if tree is not None else None
+                    nm = ("Variant" if typ == "LVVariant" else "error out" if typ == "Cluster"
+                          else "type" if o is not None else "data")
+                else:
+                    nm = names[i] if i < len(names) else "?"
+                if o is not None:
+                    self.term_owner[o.get("uid")] = (owner, nm, sink_outer)
+                else:
+                    self.term_owner[t.get("uid")] = (owner, nm, not sink_outer)
+        return right
+
+    def _inplace_cluster_pair(self, el, node, l, r, outer):
+        """An Unbundle / Bundle Elements pair, as NI's export writes it (Channel
+        Probe_Background Updater.vi): the left node `fields="elt" inputs="input cluster:.."
+        outputs="elt:.."`, the right naming it in _id, `inputs="elt:.." outputs="output
+        cluster:.."`. In the heap two decomposeClusterNodes joined by a clusterPoserInterface:
+        the dcoAgg is the cluster, reaching outside through the structure's term (0x800000 in,
+        0x800001 out); each field is a decomposeClusterDCO whose <index> counts like a Bundle By
+        Name's <i> (field_paths), absent for 0."""
+        # a WAVEFORM's pair is Waveform Unbundle / Bundle Elements in NI's export: the same heap
+        # class, the aggregate a MeasureData type (4 of 4 over NI's examples, 2026-11-06)
+        agg0 = l.find("dcoAgg")
+        t0 = next((t for t in l.find("termList") if agg0 is not None and t.find("dco") is not None
+                   and t.find("dco").get("uid") == agg0.get("uid")), None)
+        ct0 = self.tid_tree(t0.find("dco")) if t0 is not None else None
+        pname = ("Waveform Unbundle / Bundle Elements" if ct0 is not None and ct0.get("Type") == "MeasureData"
+                 else "Unbundle / Bundle Elements")
+        left = ET.SubElement(el, "Node", {"_name": pname, "uid": l.get("uid"),
+                                          "uid_parent": node.get("uid")})
+        right = ET.Element("Node", {"_id": l.get("uid"), "_name": pname,
+                                    "uid": r.get("uid"), "uid_parent": node.get("uid")})
+        fields = []
+        for half, sink_outer in ((l, True), (r, False)):
+            owner = left if half is l else right
+            agg_el = half.find("dcoAgg")
+            agg = agg_el.get("uid") if agg_el is not None else None
+            agg_term = next((t for t in half.find("termList") if t.find("dco") is not None
+                             and t.find("dco").get("uid") == agg), None)
+            # SNAPSHOT: <index> counts the fields of the type as saved (Reader.nmux)
+            ct = self.tid_tree(agg_term.find("dco"), snapshot=True) if agg_term is not None else None
+            ct = self._class_data_or_self(ct)
+            labels = [p for p, _ in aixml2vi.field_paths(ct)] if ct is not None else []
+            for t in half.find("termList"):
+                d = t.find("dco")
+                if d is None:
+                    continue
+                if d.get("uid") == agg:
+                    o = outer.get(d.get("uid"))
+                    if o is not None:
+                        self.term_owner[o.get("uid")] = (owner, "input cluster" if sink_outer else "output cluster", sink_outer)
+                    continue
+                # the field is <index> on the DCO (NI's Increase Count.vi: 5 and 4), absent for 0
+                i = int(d.findtext("index") or 0)
+                nm = labels[i] if i < len(labels) else "?"
+                if half is l:
+                    fields.append(nm)
+                self.term_owner[t.get("uid")] = (owner, nm, not sink_outer)
+        left.set("fields", ",".join(escape(x) for x in fields))
+        return right
+
+    def inplace(self, node, parent_uid):
+        """An In Place Element Structure: one Structure; each in/out pair is two Nodes named
+        "In Place In / Out Element", the right one naming the left one in _id. A pair is the
+        matchPoserInterface joining two decomposeMatchNodes; a match node's decomposeDCO names
+        the structure's OUTER terminal in its termList, its own term is the inner end."""
+        el = ET.Element("Structure", {"_name": "In Place Element Structure", "uid": node.get("uid"),
+                                      "uid_parent": parent_uid})
+        diag = node.find("diagramList/SL__arrayElement")
+        set_sublabel(el, diag)
+        outer = {}
+        for t in (node.find("termList") if node.find("termList") is not None else []):
+            d = t.find("dco")
+            if d is not None:
+                outer[d.get("uid")] = t
+        match = {n.get("uid"): n for n in self.node_defs(diag)
+                 if n.get("class") in ("decomposeMatchNode", "decomposeArrayNode", "decomposeClusterNode",
+                                       "decomposeArraySplitNode", "decomposeVariantNode", "Class017E",
+                                       "Class018D")} if diag is not None else {}
+        rights = []
+        posers = node.find("multiSegPipeFlange2Size")
+        for poser in (posers if posers is not None else []):
+            ld, rd = poser.find("multiSegPipeFlange1Depth"), poser.find("multiSegPipeFlange2Depth")
+            l = match.get(ld.get("uid")) if ld is not None else None
+            r = match.get(rd.get("uid")) if rd is not None else None
+            if l is None or r is None:
+                self.notes.append("In Place pair %s not read" % poser.get("uid"))
+                continue
+            if poser.get("class") == "arrayPoserInterface":
+                rights.append(self._inplace_array_pair(el, node, l, r, outer))
+                continue
+            if poser.get("class") == "clusterPoserInterface":
+                rights.append(self._inplace_cluster_pair(el, node, l, r, outer))
+                continue
+            if poser.get("class") in self.INPLACE_NAMED:
+                rights.append(self._inplace_named_pair(el, node, l, r, outer, poser.get("class")))
+                continue
+            lt, rt = list(l.find("termList")), list(r.find("termList"))
+            left = ET.SubElement(el, "Node", {"_name": "In Place In / Out Element", "uid": l.get("uid"),
+                                              "uid_parent": node.get("uid")})
+            right = ET.Element("Node", {"_id": l.get("uid"), "_name": "In Place In / Out Element",
+                                        "uid": r.get("uid"), "uid_parent": node.get("uid")})
+            o = outer.get(lt[0].find("dco").get("uid"))
+            if o is not None:
+                self.term_owner[o.get("uid")] = (left, "value", True)
+            self.term_owner[lt[1].get("uid")] = (left, "value", False)
+            self.term_owner[rt[0].get("uid")] = (right, "value", True)
+            o = outer.get(rt[1].find("dco").get("uid"))
+            if o is not None:
+                self.term_owner[o.get("uid")] = (right, "value", False)
+            rights.append(right)
+        # plain tunnels: one <Tunnel> with both sides, uid = the outer terminal (NI's export)
+        srn = next((n for n in self.node_defs(diag) if n.get("class") == "sRN"), None) if diag is not None else None
+        inner_terms = {}
+        for t in (srn.find("termList") if srn is not None else []):
+            if t.find("dco") is not None:
+                inner_terms.setdefault(t.find("dco").get("uid"), []).append(t)
+        tunnels, n_in, n_out = [], 0, 0
+        for term in (node.find("termList") if node.find("termList") is not None else []):
+            dd = term.find("dco")
+            if dd is None or dd.get("class") != "decomposeRecomposeTunnel":
+                continue
+            out = int(dd.findtext("objFlags") or 0) & 1
+            n_out, n_in = n_out + out, n_in + (1 - out)
+            tun = ET.Element("Tunnel", {"_id": ("Out%d" % n_out) if out else ("In%d" % n_in),
+                                        "uid": term.get("uid"), "uid_parent": node.get("uid")})
+            self.term_owner[term.get("uid")] = (tun, "value", not out)
+            for t in inner_terms.get(dd.get("uid"), []):
+                self.term_owner[t.get("uid")] = (tun, "value", bool(out))
+            tunnels.append(tun)
+        if diag is not None:
+            self.walk(diag, node.get("uid"), el)
+        for r in rights + tunnels:
+            el.append(r)
+        return el
+
+    def disable(self, node, parent_uid):
+        """Diagram / Conditional Disable Structure: a Node holding one Diagram per frame, the
+        selector " Enabled "/" Disabled " or the condition; commentTun tunnels like a case's."""
+        diagram = node.find("commentMode") is not None
+        el = ET.Element("Node", {"_name": "Diagram Disable Structure" if diagram else "Conditional Disable Structure",
+                                 "uid": node.get("uid"), "uid_parent": parent_uid})
+        frames = list(node.find("diagramList"))
+        # A Diagram Disable's ENABLED frame is the node's own activeDiag, HEX like every heap
+        # index ("%02X" in aixml2vi.add_disable). LabVIEW omits it when it holds its default, 0:
+        # measured 2026-11-09 (issue #129) - frame 0 enabled ran frame 0 and was saved with no
+        # node-level activeDiag (and no defaultDiag); frame 1 enabled was saved with activeDiag
+        # 01. Both frames carried objFlags 0x800 either way, and the selector label kept the
+        # template's text, so neither marks the enabled frame. This read a missing activeDiag
+        # as "the last frame" until then and swapped Enabled and Disabled on every structure
+        # whose frame 0 runs (JKI VI Tester's skip template); it read the value as decimal too.
+        # findtext("activeDiag") is the DIRECT child only - commentSelInfoArray holds the
+        # ExpressionInfo activeDiags of the frames' conditions.
+        active = (node.findtext("activeDiag") or "").strip()
+        try:
+            active = int(active, 16) if active else 0
+        except ValueError:
+            self.notes.append("Diagram Disable %s: activeDiag %r not read, frame 0 taken as enabled" % (node.get("uid"), active))
+            active = 0
+        conds = []
+        for info in node.findall("commentSelInfoArray/SL__arrayElement"):
+            # SelectorInfoElement > activeDiag (ExpressionInfo) > Tag0000 (the strings) and
+            # activeDiag (the tree, its root's activePlot the operator)
+            expr = info.find("activeDiag")
+            strs = [bytes.fromhex(x.text).decode("mac_roman") if x.text else ""
+                    for x in (expr.findall("Tag0000/SL__arrayElement") if expr is not None else [])]
+            root_plot = (expr.findtext("activeDiag/SL__arrayElement/activePlot") if expr is not None else None) or ""
+            op = "!=" if root_plot.upper() == "FE" else "=="
+            if len(strs) > 2:
+                # a COMPOUND condition (`A==B||C==D`, NI's Conditional Disable Structure.vi: four
+                # clauses) - not decoded; written as Default it gave the structure two Default
+                # frames, `multiple cases with same expression` (2026-11-06). Said, so the
+                # composer refuses it as lost structure rather than build a different VI
+                self.notes.append("Conditional Disable %s frame %d: condition not read" % (node.get("uid"), len(conds)))
+            conds.append("%s%s%s" % (strs[0], op, strs[1]) if len(strs) == 2 else "Default")
+        d_els = []
+        for i, fr in enumerate(frames):
+            if diagram:
+                sel = " Enabled " if i == active else " Disabled "
+            else:
+                sel = " %s " % (conds[i] if i < len(conds) else "Default")
+            d_els.append(ET.SubElement(el, "Diagram", {"selector": sel, "uid": fr.get("uid"), "uid_parent": node.get("uid")}))
+            set_sublabel(d_els[-1], fr)
+        frame_terms = []
+        for fr in frames:
+            srn = next((n for n in self.node_defs(fr) if n.get("class") == "sRN"), None)
+            ts = {}
+            for t in (srn.find("termList") if srn is not None else []):
+                d = t.find("dco")
+                if d is not None:
+                    ts.setdefault(d.get("uid"), []).append(t)
+            frame_terms.append(ts)
+        n_in = n_out = 0
+        rank = self._tunnel_ranks(node, "commentTun")
+        for term in (node.find("termList") if node.find("termList") is not None else []):
+            d = term.find("dco")
+            if d is None or d.get("class") != "commentTun":
+                continue
+            out = int(d.findtext("objFlags") or 0) & 1
+            if out:
+                n_out += 1
+            else:
+                n_in += 1
+            tid = ("Out%d" % rank.get(term.get("uid"), n_out)) if out else ("In%d" % rank.get(term.get("uid"), n_in))
+            tun = ET.Element("Tunnel", {"_id": tid, "uid": term.get("uid"), "uid_parent": node.get("uid")})
+            if int(d.findtext("objFlags") or 0) & 0x200000:
+                # cond="true", the same 0x200000 bit as on a case structure's tunnel: 87 of the 91
+                # Disable-structure tunnels over NI's shipping examples carry it (2026-11-06)
+                tun.set("cond", "true")
+            self.term_owner[term.get("uid")] = (tun, "value", not out)
+            el.append(tun)
+            for i, ts in enumerate(frame_terms):
+                for t in ts.get(d.get("uid"), []):
+                    half = ET.SubElement(d_els[i], "Tunnel", {"_id": tid, "uid": t.get("uid"), "uid_parent": frames[i].get("uid")})
+                    self.term_owner[t.get("uid")] = (half, "value", bool(out))
+        for i, fr in enumerate(frames):
+            self.walk(fr, fr.get("uid"), d_els[i])
+        return el
+
+    # ---- nodes of their own classes ------------------------------------------------------------
+    @staticmethod
+    def _is_out(term):
+        d = term.find("dco")
+        return bool(int(d.findtext("objFlags") or 0) & 1) if d is not None else False
+
+    def _class_data_or_self(self, tree):
+        """A CLASS wire's private data cluster (its fields are what an Unbundle / Bundle Elements
+        pair or a Bundle on it names - `Entity Table`, `Cashier Index` in NI's Coffee Shop, read
+        as `?` until 2026-11-06), any other type as it is."""
+        if tree is None:
+            return None
+        inner = aixml2vi.typedef_inner(tree)
+        if inner.get("Type") != "Refnum" or inner.get("RefType") != "UDClassInst":
+            return tree
+        try:
+            return aixml2vi.class_private_data(inner, [os.path.dirname(self.vi_path)] if self.vi_path else [])
+        except aixml2vi.Unsupported:
+            return tree
+
+    def _is_build_cluster_array(self, terms):
+        """A cABuild node is BUILD CLUSTER ARRAY when its output's clusters have ONE field while
+        it has several inputs, or - with one input - when that field is the input's own type
+        rather than its element's."""
+        if len(terms) < 2:
+            return False
+        out = self.tid_tree(terms[0])
+        if out is None or out.get("Type") != "Array" or out.find("TypeDesc") is None:
+            return False
+        clu = out.find("TypeDesc")
+        while clu is not None and clu.get("Type") == "TypeDef" and clu.find("TypeDesc") is not None:
+            clu = clu.find("TypeDesc")
+        if clu is None or clu.get("Type") != "Cluster":
+            return False
+        fields = [c for c in clu if c.tag == "TypeDesc"]
+        if len(fields) != 1:
+            return False
+        if len(terms) > 2:
+            return True
+        src = self.tid_tree(terms[1])
+        return src is not None and src.get("Type") != "Array"
+
+    def _node_el(self, node, parent_uid, name, **attrs):
+        el = ET.Element("Node", {"_name": name, "uid": node.get("uid"), "uid_parent": parent_uid})
+        for k, v in attrs.items():
+            el.set(k, v)
+        return el
+
+    def template_node(self, node, parent_uid):
+        cls = node.get("class")
+        el = self._node_el(node, parent_uid, TEMPLATE_CLASSES[cls])
+        terms = list(node.find("termList"))
+        names = names_for(cls, len(terms))
+        if cls == "aReplace":
+            # REPLACE ARRAY SUBSET by its DCO flags, which say what each terminal is in any
+            # number of element groups: 0x20000 the array, 0x40000 an element, 0x200000 the row
+            # index and 0x400000 the column index (both: a 1D array's index), 0x10000 disabled.
+            # A fixed-size template named prep.vi's three groups as a 5D array (2026-10-22)
+            names = []
+            for t in terms:
+                f = int(t.findtext("dco/objFlags") or 0)
+                if self._is_out(t):
+                    nm = "output array"
+                elif f & 0x20000:
+                    nm = "array"
+                elif f & 0x40000:
+                    nm = "new element/subarray"
+                elif f & 0x600000 == 0x600000:
+                    nm = "index"
+                elif f & 0x600000:
+                    nm = "index (row)" if f & 0x200000 else "index (col)"
+                else:
+                    nm = "?"
+                names.append(("disabled " if f & 0x10000 and nm.startswith("index") else "") + nm)
+            # every input listed, a DISABLED index even unwired, as on Index Array: it says the
+            # element is a row, and without it the composer took the template with both indices
+            # enabled - NI's QR decomposition update by Givens rotation.vi replaces rows and
+            # loaded `arrays of different dimensions` (2026-11-06)
+            self.ordered_inputs[id(el)] = (el, [(t.get("uid"), nm) for t, nm in zip(terms, names)
+                                               if not self._is_out(t)])
+        if cls == "aDelete":
+            # DELETE FROM ARRAY by its DCO flags, as Replace Array Subset: 0x20000 the array,
+            # 0x40000 the length (an output with it is the deleted portion), the index bits and
+            # 0x10000 disabled. NI names a 2D node's indices `index (row)` / `disabled index
+            # (col)` and writes dimensions="2" (Read Tab-Delimited File.vi); the 1D template's
+            # names called both `index` (2026-11-06)
+            names = []
+            for t in terms:
+                f = int(t.findtext("dco/objFlags") or 0)
+                if self._is_out(t):
+                    nm = "deleted portion" if f & 0x40000 else "array w/ subset deleted"
+                elif f & 0x20000:
+                    nm = "array"
+                elif f & 0x40000:
+                    nm = "length"
+                elif f & 0x600000 == 0x600000 or not f & 0x600000:
+                    nm = "index"
+                else:
+                    nm = "index (row)" if f & 0x200000 else "index (col)"
+                names.append(("disabled " if f & 0x10000 and nm.startswith("index") else "") + nm)
+            idx = sum(1 for nm in names if "index" in nm)
+            if idx > 1:
+                el.set("dimensions", str(idx))
+        if cls == "cABuild" and self._is_build_cluster_array(terms):
+            # ONE heap class, two nodes: Index & Bundle Cluster Array bundles N ARRAYS into an
+            # array of N-field clusters, Build Cluster Array N ELEMENTS into an array of one-field
+            # clusters. NI's Smith Multi Plot with Styles.vi has the second, and read as the
+            # first, its composed copy carried a type no rule explained (2026-11-06)
+            el.set("_name", "Build Cluster Array")
+            names = ["array of clusters"] + ["component element"] * (len(terms) - 1)
+        dirs = None
+        if cls in ("aReplace", "aDelete"):
+            # named by their own flags above, so their direction is the DCO's too - the template's
+            # positions do not line up with these names (an unwired `disabled index (col)` went
+            # out as an OUTPUT, and the composer found no template, 2026-11-06)
+            dirs = [not self._is_out(t) for t in terms]
+        if cls in ("printf", "scanf") and len(terms) > 4:
+            src = self.tid_tree(terms[1])
+            if src is not None and src.get("Type") in ("Path", "Refnum"):
+                # the FILE variants share the class: Format Into File / Scan From File take a
+                # path or a file refnum where the string ones take a string (NI's Format Into File
+                # and Scan From File.vi, 2026-11-06)
+                fixed = ["format string", "input file", "output file refnum", "error in", "error out"]
+                fdirs = [True, True, False, True, False]
+                rest = len(terms) - len(fixed)
+                if cls == "printf":
+                    el.set("_name", "Format Into File")
+                    names = fixed + ["input %d" % (i + 1) for i in range(rest)]
+                    dirs = fdirs + [True] * rest
+                else:
+                    el.set("_name", "Scan From File")
+                    names = fixed + [("default value %d" if i % 2 == 0 else "output %d") % (i // 2 + 1) for i in range(rest)]
+                    dirs = fdirs + [i % 2 == 0 for i in range(rest)]
+        if names is None:
+            self.notes.append("node %s: no template names its terminals" % TEMPLATE_CLASSES[cls])
+            names = ["?"] * len(terms)
+        dirs = dirs or sinks_for(cls, len(terms)) or [False] * len(terms)
+        for t, nm, tsink in zip(terms, names, dirs):
+            # a template names a repeated terminal value, value#1 ... - the #n is the composer's
+            # own key, AIXML repeats the plain name
+            # direction from the TERMINAL's sink bit (0x8000), which every WIRED input carries:
+            # Scan From String's outputs do not set bit 0 on their DCO. An UNWIRED input carries
+            # no bit at all, and the template says which way it points (sinks_for)
+            sink = bool(int(t.findtext("objFlags") or 0) & SINK) or (tsink and not (int(t.findtext("objFlags") or 0) & SOFT_SINK))
+            self.term_owner[t.get("uid")] = (el, nm.split("#")[0], sink)
+            if int(t.findtext("objFlags") or 0) & SOFT_SINK:
+                self.soft_sinks = getattr(self, "soft_sinks", set())
+                self.soft_sinks.add(t.get("uid"))
+        if cls == "cpdArith":
+            # the operation is objFlags 0x70000 only - 0x80000 is set beside it (0x90000 is a
+            # Multiply), exactly the mask the composer writes
+            op = (int(node.findtext("objFlags") or 0) >> 16) & 0x7
+            el.set("operation", CA_OPS.get(op, "Add"))
+            inv = []
+            outs = [t for t in terms if self._is_out(t)]
+            ins = [t for t in terms if not self._is_out(t)]
+            for t in outs[:1] + ins:
+                inv.append("i" if int(t.find("dco").findtext("objFlags") or 0) & 0x10000 else " ")
+            el.set("inversions", ",".join(inv))
+        if el.get("_name") in ("Array Subset", "Replace Array Subset"):
+            # NI writes the number of dimensions when it is more than one (dimensions="2"):
+            # one index terminal per dimension
+            n = sum(1 for t in terms if "index" in (self.term_owner.get(t.get("uid"), (None, ""))[1] or ""))
+            if node.findtext("nDims"):
+                # several element groups each carry their own indices: the heap says how many
+                # dimensions (prep.vi's three groups on a 1D array)
+                n = int(node.findtext("nDims"), 16)
+            if n > 1:
+                el.set("dimensions", str(n))
+        return el
+
+    def nmux(self, node, parent_uid):
+        f = int(node.findtext("objFlags") or 0)
+        unbundle, wave = bool(f & 0x10000), bool(f & 0x80000)
+        name = ("Get Waveform Components" if unbundle else "Build Waveform") if wave else \
+            ("Unbundle By Name" if unbundle else "Bundle By Name")
+        el = self._node_el(node, parent_uid, name)
+        terms = list(node.find("termList"))
+        agg = terms[0]
+        # SNAPSHOT: <i> indexes the type AS THIS FILE SAVED IT. Against a linked typedef resolved
+        # from a changed .ctl it named the wrong field - Issue136's Caller.vi unbundled `Count` of
+        # Outer {Inner {A}, Count} and read `Inner.B` once Inner gained B (2026-11-18); LabVIEW
+        # remaps the selection by NAME when it loads the file
+        ct = self.tid_tree(agg, snapshot=True)
+        # <i> counts every element depth-first, a nested cluster's fields included, and NI's
+        # export names a nested one by its dotted path (`Description.Name`)
+        labels = WAVEFORM_FIELDS if wave else [p for p, _ in (aixml2vi.field_paths(ct) if ct is not None else [])]
+        if not wave and ct is not None and aixml2vi.typedef_inner(ct).get("RefType") == "UDClassInst":
+            # a CLASS wire inside a member: the fields are the class's private data, named by
+            # their paths as NI's export writes them (MGI's Restore.vi: P.Style, P.Size, P.Font)
+            try:
+                pdata = aixml2vi.class_private_data(aixml2vi.typedef_inner(ct),
+                                                    [os.path.dirname(self.vi_path)] if self.vi_path else [])
+                labels = [p for p, _ in aixml2vi.field_paths(pdata)]
+            except aixml2vi.Unsupported:
+                pass
+        fields = []
+        for t in terms:
+            d = t.find("dco")
+            if t is agg:
+                if unbundle:
+                    self.term_owner[t.get("uid")] = (el, "waveform" if wave else "input cluster", True)
+                else:
+                    self.term_owner[t.get("uid")] = (el, "output waveform" if wave else "output cluster", False)
+                continue
+            if d is not None and d.get("class") is None:
+                # Bundle By Name's cluster input: a bare reference to the aggregate DCO
+                self.term_owner[t.get("uid")] = (el, "waveform" if wave else "input cluster", True)
+                continue
+            i = int(d.findtext("i") or 0) if d is not None else 0
+            # a NEGATIVE <i> occurs too (ErrorRing\GenerateCode.vi, vi.lib sweep 2026-11-08, read
+            # as an IndexError): no field index, so the terminal's own type names it as below
+            nm = labels[i] if 0 <= i < len(labels) else None
+            if nm is None:
+                # a CLASS's private data: the wire is a class refnum with no fields to read, but each
+                # element terminal carries the field's own labelled type (`Levels to Spawn`)
+                tt = self.tid_tree(t)
+                nm = (self._field_name(tt) if tt is not None else None) or "?"
+            fields.append(nm)
+            self.term_owner[t.get("uid")] = (el, nm, not self._is_out(t))
+        el.set("fields", ",".join(escape(x) for x in fields))
+        return el
+
+    def mux(self, node, parent_uid):
+        el = self._node_el(node, parent_uid, "Bundle")
+        terms = list(node.find("termList"))
+        agg, cref = terms[0], terms[1]
+        # a CLASS wire's fields are its private data (`Cashier Index` in NI's Coffee Shop messages)
+        # SNAPSHOT: one terminal per field of the type as saved (Reader.nmux)
+        ct = self._class_data_or_self(self.tid_tree(agg, snapshot=True))
+        # a typedef'd field is labelled on the type it wraps (Control Ref Queue in the Math Plots)
+        labels = [self._field_name(c) or "element" for c in (aixml2vi.fields(aixml2vi.typedef_inner(ct)) if ct is not None else [])]
+        self.term_owner[agg.get("uid")] = (el, "output cluster", False)
+        self.term_owner[cref.get("uid")] = (el, "cluster", True)
+        order = []
+        for k, t in enumerate(terms[2:]):
+            nm = labels[k] if k < len(labels) else "element"
+            self.term_owner[t.get("uid")] = (el, nm, True)
+            order.append((t.get("uid"), nm))
+        # EVERY element input in field order, an unwired one as `element:`, then `cluster` - as
+        # NI's export writes it. With a cluster wired in, a Bundle REPLACES the wired fields only,
+        # and an unlabelled field is known by its POSITION: wired-only, IIR Filter Design.vi's
+        # `element:Spectrum out` (the third field, an array) became the first (a double) -
+        # `1D array of double` into `double`, 2026-11-06. NI: `element:,element:,element:..,cluster:..`
+        self.ordered_inputs[id(el)] = (el, order + [(cref.get("uid"), "cluster")])
+        return el
+
+    def demux(self, node, parent_uid):
+        el = self._node_el(node, parent_uid, "Unbundle")
+        terms = list(node.find("termList"))
+        agg = terms[0]
+        # SNAPSHOT: one terminal per field of the type as saved (Reader.nmux)
+        ct = self._class_data_or_self(self.tid_tree(agg, snapshot=True))
+        # a typedef'd field is labelled on the type it wraps (Control Ref Queue in the Math Plots)
+        labels = [self._field_name(c) or "element" for c in (aixml2vi.fields(aixml2vi.typedef_inner(ct)) if ct is not None else [])]
+        self.term_owner[agg.get("uid")] = (el, "cluster", True)
+        for k, t in enumerate(terms[1:]):
+            self.term_owner[t.get("uid")] = (el, labels[k] if k < len(labels) else "element", False)
+        return el
+
+    def aindx(self, node, parent_uid):
+        """Index Array: [array, output, its indices..., output, its indices...] (the composer's
+        measurement); a 2D array names its indices "index (row)"/"index (col)", a disabled one
+        (DCO 0x10000) "disabled index (..)" - listed even unwired, which is how the dimension
+        that stays is said - and its output is then a subarray."""
+        el = self._node_el(node, parent_uid, "Index Array")
+        terms = list(node.find("termList"))
+        src = terms[0]
+        at = self.tid_tree(src)
+        # a TYPEDEF'd array counts its own dimensions (interpolate_color.vi's 2D colour table)
+        at = aixml2vi.typedef_inner(at) if at is not None else None
+        n = len(at.findall("Dimension")) if at is not None and at.get("Type") == "Array" else 1
+        if n > 1:
+            el.set("dimensions", str(n))
+        self.term_owner[src.get("uid")] = (el, "array", True)
+        order = [(src.get("uid"), "array")]
+        # a 3D array's indices are page, row and column in NI's export (OpenG's Write GIF File
+        # Example.vi, 2026-11-06)
+        d_names = (["index (row)", "index (col)"] if n == 2 else
+                   ["index (page)", "index (row)", "index (col)"] if n == 3 else ["index"] * n)
+        k = 0
+        for t in terms[1:]:
+            if self._is_out(t):
+                tree = self.tid_tree(t)
+                # a disabled index makes the output a SUBARRAY - LabVIEW may type it SubArray in
+                # VCTP rather than Array (Read CSV.vi's row out of a 2D array, 2026-10-27)
+                nm = "subarray" if tree is not None and tree.get("Type") in ("Array", "SubArray") else "element"
+                self.term_owner[t.get("uid")] = (el, nm, False)
+                k = 0
+            else:
+                f = int(t.find("dco").findtext("objFlags") or 0)
+                nm = d_names[k % n] if n > 1 else "index"
+                if f & 0x10000:
+                    nm = "disabled " + nm
+                self.term_owner[t.get("uid")] = (el, nm, True)
+                order.append((t.get("uid"), nm))
+                k += 1
+        self.ordered_inputs[id(el)] = (el, order)
+        return el
+
+    def abuild(self, node, parent_uid):
+        # BUILD MATRIX is the same class with node objFlags 0x200000 and a matrix typedef out -
+        # 9 of 9 over NI's shipping examples (Linear Algebra Calculator.vi, 2026-11-06)
+        el = self._node_el(node, parent_uid, "Build Matrix" if int(node.findtext("objFlags") or 0) & 0x200000 else "Build Array")
+        terms = list(node.find("termList"))
+        out = next((t for t in terms if self._is_out(t)), None)
+        ot = self.tid_tree(out) if out is not None else None
+        # inputs in termList order, which is the order LabVIEW builds in (a probe with 1 then 2
+        # built [1,2]; reading them reversed broke the round trip of t66)
+        kinds, deep = [], False
+        for t in terms:
+            if t is out:
+                self.term_owner[t.get("uid")] = (el, "appended array", False)
+            else:
+                tt = self.tid_tree(t)
+                same = tt is not None and ot is not None and aixml_type(lvheap.strip_label(tt)) == aixml_type(lvheap.strip_label(ot))
+                # a CONCATENATED input has the output's RANK; comparing whole types missed one
+                # whose array is a typedef'd (or differently labelled) copy of the output's -
+                # ex_updatePropFromTree.vi's user-def properties, stacked into a 2D array, 2026-10-23
+                same = same or (tt is not None and ot is not None and self._rank(tt) == self._rank(ot) > 0)
+                # a CONCATENATING input carries DCO flag 0x10000 (the composer's measurement); NI
+                # writes that mode as concat="true", and the reader dropped it (Read CSV.vi,
+                # 2026-10-27). The flag also NAMES the input `array`: the type comparison above
+                # misses a SUBARRAY (Reverse 1D Array's output, LabVIEW's type 0x4F), and NI's
+                # Word Wrapping in Picture Control.vi then came back as element + array - composed,
+                # `1D (sub)array of unsigned long` into an `unsigned long` element (2026-11-06)
+                concat = bool(int(t.findtext("dco/objFlags") or 0) & 0x10000)
+                kind = "array" if same or concat else "element"
+                kinds.append(kind)
+                self.term_owner[t.get("uid")] = (el, kind, True)
+                if int(t.findtext("dco/objFlags") or 0) & 0x800000:
+                    deep = True
+        # NI writes concat="true" when EVERY input is an `array` (one input too) or an input's DCO
+        # carries 0x800000 - 69 of 69 over its examples; the 0x10000 input flag alone set it on 125
+        # nodes NI writes without (`array, element`), 2026-11-06
+        if kinds and (all(k == "array" for k in kinds) or deep):
+            el.set("concat", "true")
+        return el
+
+    @staticmethod
+    def _rank(tree):
+        """Array rank of a type, through typedef wrappers; 0 for a scalar."""
+        while tree is not None and tree.get("Type") == "TypeDef":
+            tree = next((c for c in tree if c.tag == "TypeDesc"), None)
+        if tree is None or tree.get("Type") != "Array":
+            return 0
+        return max(1, len(tree.findall("Dimension")))
+
+    HGROW = {0x10000: ("reference", True), 0x40001: ("reference out", False),
+             0x20000: ("error in (no error)", True), 0x80001: ("error out", False)}
+
+    _LEARNED_CLASSES = None
+
+    @classmethod
+    def learned_classes(cls):
+        """parts/class-ids-learned.json (learn_node_classes.py): CtlFlags -> class for the classes
+        refnum-classes.tsv lacks (XYGraph 0x0053, Scrollbar 0x005A, Pane 0x004B ...), and the
+        class of a node with NO reference input by its own name (`WFChart` -> LV.WaveformChart)."""
+        if cls._LEARNED_CLASSES is None:
+            p = os.path.join(aixml2vi.OWN_PARTS, "class-ids-learned.json")
+            cls._LEARNED_CLASSES = json.load(open(p, encoding="utf-8")) if os.path.exists(p) else {}
+        return cls._LEARNED_CLASSES
+
+    def _hgrow_name(self, term, default):
+        """A property or invoke node's fixed terminal by its role (`reference`, `error out`) - but
+        a USER-DEFINED refnum's reference terminals by their type's label, as NI's export names
+        them: a DAQmx node's `task out` in and out, a System Configuration node's `System
+        Hardware` / `System Hardware out`. Not a LabVIEW object refnum's: its label is the
+        SOURCE's (`reference out` on an invoke node's input), and NI writes `reference` there -
+        taking it broke t91's round trip."""
+        if not default.startswith("reference"):
+            return default
+        tree = self.tid_tree(term)
+        label = tree.get("Label") if tree is not None else None
+        while tree is not None and tree.get("Type") == "TypeDef":
+            # a typedef'd session (IMAQdx Session.ctl): the refnum is inside, and NI names the
+            # terminal after the TYPEDEF's own label (`IMAQdx Session`), not the wired source's
+            # (`Session Out`) - its export of Getting Started with Attributes.vi, 2026-11-13
+            tree = next((c for c in tree if c.tag == "TypeDesc"), None)
+            label = (tree.get("Label") if tree is not None else None) or label
+        if tree is not None and tree.get("RefType") in ("UsrDefndTag", "UsrDefined") and label:
+            return label
+        return default
+
+    def _vi_server_class(self, node):
+        """The class NI's export writes on a property or invoke node, read off its reference
+        input's refnum - each rule taken from NI's exports by learn_node_classes.py: a user-
+        defined TAG refnum is `GenClassTag.<Ident>.<TypeName>` (`GenClassTag.NetworkStream.
+        DataExchange`) - but `GenClassTag.<node name>.<TypeName>` for DAQmx (a Task's Trigger
+        properties: `GenClassTag.DAQmx Trigger.NIDAQ`), a user-defined refnum
+        `GenClass.<Ident>.<TypeName>`, ActiveX `ActiveX`, .NET `DotNet`, .NET Core (refnum type
+        39) `DotNetCore`, VISA `Visa.<Ident>`."""
+        learned = self.learned_classes()
+        node_name = (node.findtext("nodeName") or "").strip('"')
+        for t in node.find("termList"):
+            d = t.find("dco")
+            if d is not None and d.get("class") == "hGrowCItem" and int(d.findtext("objFlags") or 0) == 0x10000:
+                tree = self.tid_tree(t)
+                # a TYPEDEF'd refnum names its class on the type it wraps: an IMAQdx session's
+                # reference input is the driver's `IMAQdx Session` typedef, and the node read `{?}`
+                # 85 times over the IMAQdx examples where NI writes {GenClassTag.IMAQdx.IMAQdx}
+                while tree is not None and tree.get("Type") == "TypeDef":
+                    tree = next((c for c in tree if c.tag == "TypeDesc"), None)
+                if tree is None:
+                    return None
+                rt = tree.get("RefType")
+                if rt == "LVObjCtl":
+                    return ref_class_name(tree.get("CtlFlags")) or \
+                        learned.get("classes", {}).get((tree.get("CtlFlags") or "").upper())
+                if rt == "UDClassInst":
+                    return "UDClassInst"
+                if rt == "VisaRef":
+                    # a VISA session's properties: NI exports the node as type="{Visa.Instr}"
+                    # (Simple Serial.vi), the class from the refnum's Ident
+                    return "Visa." + (tree.get("Ident") or "Instr")
+                if rt in ("UsrDefndTag", "IVIRef") and aixml2vi.tag_class(tree, node_name):
+                    return aixml2vi.tag_class(tree, node_name)     # DAQmx by node, else by Ident
+                if rt == "UsrDefined" and tree.get("Ident") and tree.get("TypeName"):
+                    return "GenClass.%s.%s" % (tree.get("Ident"), tree.get("TypeName"))
+                return {"AutoRef": "ActiveX", "DotNet": "DotNet", "39": "DotNetCore"}.get(rt)
+        # no reference input: an implicit node on a control, This VI, the application
+        short = node_name.replace(" (strict)", "")
+        return learned.get("nodeNames", {}).get(short) or self.class_by_node_name().get(short)
+
+    _CLASS_BY_NODE_NAME = None
+
+    @classmethod
+    def class_by_node_name(cls):
+        """The VI Server class whose property node carries this nodeName, read off the harvested
+        table (vi-server-props.json: every LV.* class with its nodeName - unique per class), plus
+        the two short forms a node bound to a control writes that the table spells longer (`Arr`,
+        `Clust`). class-ids-learned.json knew 11 names; the other implicit nodes of the NI examples
+        - `Bool` 166 times, `DigNum` 37, `Str` 12, `IntChart`, `Pict`, `LstBox`, `SubPnl`, `Enum`,
+        `XYGraph` - were written type="{?}" and refused (palette sweep, 2026-11-19)."""
+        if cls._CLASS_BY_NODE_NAME is None:
+            p = os.path.join(aixml2vi.OWN_PARTS, "vi-server-props.json")
+            table = json.load(open(p, encoding="utf-8")).get("classes", {}) if os.path.exists(p) else {}
+            seen = {}
+            for c, row in table.items():
+                if c.startswith("LV.") and row.get("nodeName"):
+                    seen.setdefault(row["nodeName"].replace(" (strict)", ""), []).append(c)
+            out = {n: cs[0] for n, cs in seen.items() if len(cs) == 1}
+            out.update({"Arr": "LV.Array", "Clust": "LV.Cluster"})
+            cls._CLASS_BY_NODE_NAME = out
+        return cls._CLASS_BY_NODE_NAME
+
+    _PROP_NAMES = None
+    _EXPORT_PROP_NAMES = None
+
+    @classmethod
+    def export_prop_names(cls):
+        """property code path ('104013829' or 'a/b' for a nested one) -> the name NI's exporter
+        writes for it, learned off its exports of whole VIs (parts/property-export-names.json,
+        learn_prop_names.py) - only codes every pair agreed on."""
+        if cls._EXPORT_PROP_NAMES is None:
+            p = os.path.join(aixml2vi.OWN_PARTS, "property-export-names.json")
+            cls._EXPORT_PROP_NAMES = json.load(open(p, encoding="utf-8")).get("names", {}) if os.path.exists(p) else {}
+        return cls._EXPORT_PROP_NAMES
+
+    @classmethod
+    def catalogue_name(cls, klass, name, code):
+        """The property name as NI's export writes it. The heap keeps the name the node was
+        saved with - "Diagram", "Panel", "FP.Open" - while LabVIEW's export writes the long
+        catalogue name: 18 "Block Diagram" against 0 "Diagram" on {LV.VI} in the cache, the
+        heap of NI's Using Traverse.vi saying "Diagram". A name the catalogue does not list for
+        the class is replaced by the one catalogued name harvested with the same code."""
+        if cls._PROP_NAMES is None:
+            cat = set()
+            with open(os.path.join(aixml2vi.DOCS, "vi-server-properties.tsv"), encoding="utf-8") as f:
+                for line in f:
+                    row = line.rstrip("\r\n").split("\t")
+                    if len(row) > 1 and row[0].startswith("{LV."):
+                        cat.add((row[0][1:-1], row[1]))
+            path = os.path.join(aixml2vi.OWN_PARTS, "vi-server-props.json")
+            props = json.load(open(path, encoding="utf-8"))["props"] if os.path.exists(path) else {}
+            by_code = {}
+            for k, rows in props.items():
+                for n, r in rows.items():
+                    if (k, n) in cat:
+                        by_code.setdefault((k, r.get("code")), set()).add(n)
+            cls._PROP_NAMES = (cat, by_code)
+        cat, by_code = cls._PROP_NAMES
+        if (klass, name) in cat or code is None:
+            return name
+        names = by_code.get((klass, code), set())
+        return next(iter(names)) if len(names) == 1 else name
+
+    def propnode(self, node, parent_uid):
+        cls = self._vi_server_class(node) or "?"
+        el = self._node_el(node, parent_uid, "Property Node")
+        fields = []
+        for t in node.find("termList"):
+            d = t.find("dco")
+            if d is None:
+                continue
+            if d.get("class") == "hGrowCItem":
+                role = self.HGROW.get(int(d.findtext("objFlags") or 0))
+                if role:
+                    self.term_owner[t.get("uid")] = (el, self._hgrow_name(t, role[0]), role[1])
+            elif d.get("class") == "propItem":
+                infos = d.findall("propList/SL__arrayElement")
+                name = ".".join(unquote(i.findtext("PropItemName") or "") for i in infos)
+                code = infos[-1].findtext("PropItemCode") if infos else None
+                codepath = "/".join(i.findtext("PropItemCode") or "?" for i in infos)
+                self.prop_items.setdefault(node.get("uid"), []).append((cls, codepath))
+                # a small code is unique only within its class (a DAQmx Timing property's 12760):
+                # learned under "<class>|<codes>", a LabVIEW one under its codes alone
+                learned = self.export_prop_names().get(codepath) or \
+                    self.export_prop_names().get("%s|%s" % (cls, codepath))
+                if learned:
+                    # the name NI's exporter writes for these codes, learned off its own exports
+                    # (learn_prop_names.py): `HasConditionalTerm` is `Has Conditional Terminal?`
+                    name = learned
+                else:
+                    name = self.catalogue_name(cls, name, int(code) if code and code.lstrip("-").isdigit() else 0)
+                if cls == "UDClassInst":
+                    # a CLASS property is named without its folder in NI's export: `Module ID` for
+                    # DQMH's `Accessors:Module ID`, `Name` for SFTP's `Properties:Name` (2026-11-06)
+                    name = name.split(":")[-1]
+                out = bool(int(d.findtext("objFlags") or 0) & 1)
+                fields.append(("read+" if out else "write+") + escape(name))
+                self.term_owner[t.get("uid")] = (el, name, not out)
+        el.set("fields", ",".join(fields))
+        link = self._implicit_link(node.find("ddo"))
+        if link is not None:
+            el.set("link", link)
+        el.set("type", "{%s}" % cls)
+        return el
+
+    def eventreg(self, node, parent_uid):
+        """Register For Events (eventRegNode): built like a property node - four fixed hGrowCItem
+        terminals (registration refnum in and out, error in and out) - plus one eventRegItem per
+        event source. Its inputs are written in NI's order, `event registration refnum:`, `error
+        in (no error):`, then one `event source:` per item IN ITEM ORDER, because the composer
+        pairs the i-th source with the i-th item (aixml2vi.add_event_reg). It was not read at all,
+        which dropped every user event's wiring and failed the round trip of t118-t125."""
+        el = self._node_el(node, parent_uid, "Register For Events")
+        roles = {0x10000: ("event registration refnum", True), 0x40001: ("event registration refnum", False),
+                 0x20000: ("error in (no error)", True), 0x80001: ("error out", False)}
+        head, sources = [], []
+        for t in node.find("termList"):
+            d = t.find("dco")
+            if d is None:
+                continue
+            if d.get("class") == "hGrowCItem":
+                role = roles.get(int(d.findtext("objFlags") or 0))
+                if role:
+                    self.term_owner[t.get("uid")] = (el, role[0], role[1])
+                    if role[1]:
+                        head.append((t.get("uid"), role[0]))
+            elif d.get("class") == "eventRegItem":
+                self.term_owner[t.get("uid")] = (el, "event source", True)
+                sources.append((t.get("uid"), "event source"))
+        head.sort(key=lambda x: 0 if x[1] == "event registration refnum" else 1)
+        self.ordered_inputs[id(el)] = (el, head + sources)
+        return el
+
+    def invokenode(self, node, parent_uid):
+        cls = self._vi_server_class(node) or "?"
+        el = self._node_el(node, parent_uid, "Invoke Node", target=unquote(node.findtext("methName") or ""),
+                           type="{%s}" % cls)
+        link = self._implicit_link(node.find("ddo"))
+        if link is not None:
+            # an IMPLICIT invoke node, bound to a front-panel object as NI's export writes it -
+            # an XControl's own method on its instance (Run Dual Mode Thermometer XControl.vi)
+            el.set("link", link)
+        for t in node.find("termList"):
+            d = t.find("dco")
+            if d is None:
+                continue
+            if d.get("class") == "hGrowCItem":
+                role = self.HGROW.get(int(d.findtext("objFlags") or 0))
+                if role:
+                    self.term_owner[t.get("uid")] = (el, self._hgrow_name(t, role[0]), role[1])
+            elif d.get("class") == "invokeItem":
+                tree = self.tid_tree(t)
+                if tree is None or tree.get("Type") == "Void":
+                    continue
+                out = bool(int(d.findtext("objFlags") or 0) & 1)
+                # a typedef'd parameter is labelled on the type it wraps (Rotate's Axis on a
+                # SceneObject, the 3D Picture Control's VIs - the XControl sweep, 2026-10-22)
+                self.term_owner[t.get("uid")] = (el, self._field_name(tree) or "?", not out)
+        return el
+
+    @staticmethod
+    def _field_name(e):
+        """A cluster field's label - Source and Type are TYPEDEFS labelled on the wrapped type."""
+        inner = e.find("TypeDesc") if e.get("Type") == "TypeDef" else None
+        return e.get("Label") or (inner.get("Label") if inner is not None else None)
+
+    def eventdata(self, node, parent_uid):
+        # an Event Filter Node is an eventDataNode too, without the data node's 0x10000 (NI's
+        # Drag and Drop example: 0x150000 against 0x140000) - its fields are INPUTS, handed back
+        # to LabVIEW (Accepted?, Discard?), and its aggregate has a second, DCO-less terminal
+        flt = not int(node.findtext("objFlags") or 0) & 0x10000
+        el = self._node_el(node, parent_uid, "Event Filter Node" if flt else "Event Data Node")
+        fields = []
+        terms = list(node.find("termList"))
+        agg = self.tid_tree(terms[0]) if terms else None
+        elems = [c for c in agg if c.tag == "TypeDesc"] if agg is not None else []
+        for t in terms[1:]:
+            if t.find("dco/typeDesc") is None:
+                continue
+            tree = self.tid_tree(t)
+            nm = self._field_name(tree) if tree is not None else None
+            if not nm and tree is not None:
+                # LabVIEW's own save may type a field terminal WITHOUT a label (NI's Graph
+                # Events.vi: Type). Named by the one cluster field of that type; <i> is NOT the
+                # position - LabVIEW numbers drag fields 17 and 18 at positions 8 and 9 - so it
+                # is only a tie-breaker, and only where the field there has that type
+                sig = repr(aixml2vi.type_sig(tree))
+                same = [e for e in elems if repr(aixml2vi.type_sig(e)) == sig]
+                idx = t.findtext("dco/i")
+                if len(same) == 1:
+                    nm = self._field_name(same[0])
+                elif idx is not None and idx.strip().isdigit() and int(idx) < len(elems) and elems[int(idx)] in same:
+                    nm = self._field_name(elems[int(idx)])
+            nm = nm or "?"
+            fields.append(nm)
+            self.term_owner[t.get("uid")] = (el, nm, flt)
+        el.set("fields", ",".join(escape(x) for x in fields))
+        return el
+
+    def statvi(self, node, parent_uid):
+        el = self._node_el(node, parent_uid, "Static VI Reference")
+        recs = self.call_targets.get(node.get("uid"), {})
+        el.set("target", recs.get("SVVI") or next(iter(recs.values()), "?"))
+        if int(node.findtext("objFlags") or 0) & 0x10000000:
+            # strictly typed: the refnum carries the callee's pane (NI exports strict="true")
+            el.set("strict", "true")
+        for t in node.find("termList"):
+            self.term_owner[t.get("uid")] = (el, "value", False)
+        return el
+
+    def ctlref(self, node, parent_uid):
+        el = self._node_el(node, parent_uid, "VI Server Reference")
+        ddo = node.find("ddo")
+        if ddo is not None:
+            ctl = self.ctl_by_ddo.get(ddo.get("uid"))
+            pane = self.panes_by_ddo().get(ddo.get("uid")) if ctl is None else None
+            sub = None
+            if ctl is None and pane is None:
+                sub = next((o for o in self.b.fp.iter("SL__arrayElement")
+                            if o.get("uid") == ddo.get("uid") and o.get("class") == "stdSubPanel"), None)
+            if pane is not None:
+                # a reference to a PANE, named by its label as NI names a pane's event source
+                el.set("element", escape(pane))
+                name = pane
+            elif sub is not None:
+                # a SUBPANEL is no control: NI's export writes the reference typed {LV.SubPanel},
+                # with no element, its output named by the subpanel's label (21 over NI's
+                # examples, read as element="?" until 2026-11-06)
+                el.set("type", "{LV.SubPanel}")
+                name = label_text(sub) or "?"
+            else:
+                el.set("element", ctl.get("_name") if ctl is not None else "?")   # escaped, as NI writes it
+                name = label_of(ctl.get("_name")) if ctl is not None else "?"
+        else:
+            name = lvheap.pylv_to_text(unquote(node.findtext("label/textRec/text") or "This VI"))
+            tree = self.tid_tree(node.find("termList/SL__arrayElement"))
+            cls = ref_class_name(tree.get("CtlFlags")) if tree is not None else None
+            el.set("type", "{%s}" % (cls or "LV.VI"))
+        for t in node.find("termList"):
+            self.term_owner[t.get("uid")] = (el, name, False)
+        return el
+
+    def gref(self, node, parent_uid):
+        t = node.find("termList/SL__arrayElement")
+        tree = self.tid_tree(t) if t is not None else None
+        name = (tree.get("Label") if tree is not None else None) or "?"
+        if name == "?" and node.find("connectorTM") is None and t is not None:
+            # a LOCAL whose type carries no label names its control by paramIdx: the index among
+            # the panel's controls (fPDCO order) - make_plot_contour.vi's paramIdx 6 is its 7th,
+            # `Contour Array`
+            # ...counted in the panel's ddoList, OLDEST first (the zPlane order is newest first:
+            # it named make_plot_contour.vi's paramIdx 6 `Contour Array` where it is the cluster
+            # `Contour Properties`)
+            i = int(t.findtext("dco/paramIdx") or 0)
+            fps = {e.get("uid"): e for e in self.b.fp.iter("SL__arrayElement") if e.get("class") == "fPDCO"}
+            dl = next(self.b.fp.iter("ddoList"), None)
+            order = [e.get("uid") for e in dl] if dl is not None else []
+            f = fps.get(order[i]) if i < len(order) else None
+            if f is not None and f.find("ddo") is not None:
+                name = label_text(f.find("ddo")) or "?"
+        if node.find("connectorTM") is not None:
+            # a GLOBAL variable: the same gRef with the global VI's pane and a call link
+            recs = self.call_targets.get(node.get("uid"), {})
+            el = self._node_el(node, parent_uid, "Global Variable", element=name,
+                               target=recs.get("IUVI") or next(iter(recs.values()), "?"))
+        else:
+            el = self._node_el(node, parent_uid, "Local Variable", element=name)
+        if t is not None:
+            self.term_owner[t.get("uid")] = (el, name, not self._is_out(t))
+        return el
+
+    def feedback(self, node, parent_uid):
+        el = self._node_el(node, parent_uid, "Feedback Node")
+        for t in node.find("termList"):
+            d = t.find("dco")
+            nm = {"initFeedback": "initializer", "leftFeedback": "previous value"}.get(d.get("class") if d is not None else "")
+            if nm:
+                self.term_owner[t.get("uid")] = (el, nm, nm == "initializer")
+        su = node.find("SlaveFBInputNode")
+        slave = self.slaves.get(su.get("uid")) if su is not None else None
+        if slave is not None:
+            for t in slave.find("termList"):
+                d = t.find("dco")
+                if d is not None and d.get("class") == "rightFeedback":
+                    self.term_owner[t.get("uid")] = (el, "next value", True)
+                    init = self.fb_inits.get(d.get("uid"))
+                    if init is not None:
+                        self.term_owner[init.get("uid")] = (el, "initializer", True)
+        return el
+
+    def expr(self, node, parent_uid):
+        el = self._node_el(node, parent_uid, "Expression Node",
+                           text=lvheap.pylv_to_text(unquote(node.findtext("textNodeLabel/textRec/text") or "")))
+        terms = list(node.find("termList"))
+        for t in terms:
+            self.term_owner[t.get("uid")] = (el, "output" if self._is_out(t) else "input", not self._is_out(t))
+        return el
+
+    # A primitive saved in an OLDER, COMPACT layout - parmIndex 0..n-1 where the name tables know
+    # the current pane's slots: Variant To Data (8003) in MGI's Restore.vi is a 5-slot icon,
+    # variant and type on top beside data, error in and out below (read off the wires: the
+    # error cluster into 0, the variant into 2, the type constant into 3). The composer writes
+    # the current form, which names the same five terminals.
+    COMPACT_FORMS = {8003: {0: "error in", 1: "error out", 2: "Variant", 3: "type", 4: "data"}}
+
+    # Call By Reference's own four terminals, by DCO objFlags (Gaussian surface data.vi)
+    CBR_OWN = {0x10000: ("reference", True), 0x40001: ("reference out", False),
+               0x20000: ("error in (no error)", True), 0x80001: ("error out", False)}
+
+    def callbyref(self, node, parent_uid):
+        """CALL BY REFERENCE, as NI's export writes it: the node's own reference and error
+        terminals plus one per slot of the CALLEE's pane, named by that slot's label in the
+        node's connectorTM (paramIdx = the slot) - and that pane as type="function{..}", NI's
+        own literal, from which the composer builds the node and the strict VI refnum feeding it."""
+        m = lvheap.TYPEID_RE.fullmatch((node.findtext("connectorTM") or "").strip())
+        pane = self.b.heap_type_tree(int(m.group(1))) if m else None
+        # CBRSaveStyle names the node: 01 Start Asynchronous Call, 02 Wait On Asynchronous Call -
+        # 17 of 17 over NI's shipping examples were read as plain Call By Reference (2026-11-06)
+        style = (node.findtext("CBRSaveStyle") or "").strip()
+        name = {"01": "Start Asynchronous Call", "02": "Wait On Asynchronous Call"}.get(style, "Call By Reference")
+        el = self._node_el(node, parent_uid, name, type=aixml_type(pane) or "")
+        slots = [c for c in pane if c.tag == "TypeDesc"] if pane is not None else []
+        for t in node.find("termList"):
+            d = t.find("dco")
+            f = int(d.findtext("objFlags") or 0)
+            if d.get("class") == "hGrowCItem":
+                nm, sink = self.CBR_OWN.get(f, ("?", not self._is_out(t)))
+            else:
+                i = int(d.findtext("paramIdx") or 0)
+                nm = (slots[i].get("Label") if i < len(slots) else None) or "?"
+                sink = not self._is_out(t)
+            self.term_owner[t.get("uid")] = (el, nm, sink)
+        return el
+
+    def scriptnode(self, node, parent_uid):
+        """A SCRIPT NODE (MATLAB script): a Formula Node's shape - variables on the border named by
+        vblName, the code in `formula` - plus an error in and out (vblName "??") and a script
+        server (scriptName). Its outputs' types are the user's choice, declared nowhere in the
+        code, so the reader hands them on after </VI> (`scripttypes`)."""
+        code = unquote(node.findtext("formula/text") or "")
+        kind = unquote(node.findtext("scriptName/text") or "") or "MATLAB script"
+        el = self._node_el(node, parent_uid, kind, text=escape_value(code))
+        types = []
+        for t in node.find("termList"):
+            nm = unquote(t.findtext("dco/vblName/text") or "")
+            out = self._is_out(t)
+            if nm == "??":
+                nm = "error out" if out else "error in"
+            elif out:
+                lt = aixml_type(self.tid_tree(t))
+                if lt:
+                    types.append("%s:%s" % (escape(nm), lt))
+            self.term_owner[t.get("uid")] = (el, nm, not out)
+        if types:
+            self.script_types = getattr(self, "script_types", [])
+            self.script_types.append((el, types))
+        return el
+
+    def decimate(self, node, parent_uid):
+        """DECIMATE 1D ARRAY: its array input and one output per element of the cycle, named as
+        LabVIEW's help names them - `elements at index 0`, `elements at index 1`, ... - in
+        terminal order (make_plot_contour.vi, three outputs)."""
+        el = self._node_el(node, parent_uid, "Decimate 1D Array")
+        k = 0
+        for t in node.find("termList"):
+            if self._is_out(t):
+                self.term_owner[t.get("uid")] = (el, "elements at index %d" % k, False)
+                k += 1
+            else:
+                self.term_owner[t.get("uid")] = (el, "array", True)
+        return el
+
+    def fbox(self, node, parent_uid):
+        """A FORMULA NODE (fBox), as NI's export writes it - a Node whose terminals are named by
+        their variables (a variable both read and written appears in inputs AND outputs) - plus
+        the CODE as text=, which NI's export leaves out: without it a composed Formula Node is
+        empty and its outputs never written. text= is the attribute an Expression Node carries,
+        so the document stays inside NI's schema."""
+        code = unquote(node.findtext("formula/text") or "")
+        el = self._node_el(node, parent_uid, "Formula Node", text=escape_value(code))
+        for t in node.find("termList"):
+            nm = unquote(t.findtext("dco/vblName/text") or "")
+            self.term_owner[t.get("uid")] = (el, nm, not self._is_out(t))
+        return el
+
+    # ---- wiring --------------------------------------------------------------------------------
+    def wire(self, diag):
+        sl = diag.find("signalList")
+        for sig in (sl if sl is not None else []):
+            # an Event Structure's DYNAMIC event terminal is no AIXML terminal: NI's export simply
+            # leaves that end out of the registration's net, and so does the reader (IGNORED)
+            all_ends = [self.term_owner.get(t.get("uid"), MISSING) for t in sig.find("termList")]
+            had_ignored = any(e is IGNORED for e in all_ends)
+            ends = [e for e in all_ends if e is not IGNORED]
+            ends = [None if e is MISSING else e for e in ends]
+            if any(e is None for e in ends):
+                self.notes.append("signal %s touches an unread terminal" % sig.get("uid"))
+                continue
+            srcs = [e for e in ends if not e[2]]
+            if len(srcs) > 1:
+                # inputs flagged SOFT_SINK instead of SINK: the one end without it is the source
+                soft = getattr(self, "soft_sinks", set())
+                uids = [t.get("uid") for t in sig.find("termList")
+                        if self.term_owner.get(t.get("uid"), MISSING) is not IGNORED]
+                hard = [e for u, e in zip(uids, ends) if not e[2] and u not in soft]
+                if len(hard) == 1:
+                    for u, e in zip(uids, ends):
+                        if not e[2] and u in soft:
+                            self.term_owner[u] = (e[0], e[1], True)
+                    ends = [self.term_owner[u] for u in uids]
+                    srcs = hard
+            if not srcs and had_ignored and ends:
+                # the source is an end AIXML has no terminal for (a Timed Loop's data node): NI
+                # names such a net after its FIRST consumer and wires every sink to it - named at
+                # the END of the wiring (_name_sourceless), when every other net name is known
+                self._sourceless = getattr(self, "_sourceless", [])
+                self._sourceless.append((sig, ends))
+                continue
+            if len(srcs) != 1:
+                self.notes.append("signal %s has %d sources" % (sig.get("uid"), len(srcs)))
+                continue
+            src_el, src_term, _ = srcs[0]
+            if src_term in INTERNAL_TERMS:
+                net = "%s.value" % src_el.get("uid")
+                if src_term == "#count":
+                    src_el.set("count", net)
+                elif src_term == "#maxout":
+                    src_el.set("maxout", net)
+                elif src_term == "#selectout":
+                    src_el.set("selectout", net)
+            else:
+                net = "%s.%s" % (src_el.get("uid"), escape(src_term))
+                # two outputs of one name (Index Array's element, element) must not share a net
+                # name - the second wire then read the first one (round trip of t78)
+                self.used_nets = getattr(self, "used_nets", set())
+                base, k = net, 2
+                while net in self.used_nets:
+                    net = "%s%d" % (base, k)
+                    k += 1
+                self.used_nets.add(net)
+                self._add(src_el, "outputs", src_term, net)
+            for tu in sig.find("termList"):
+                self.term_net[tu.get("uid")] = net
+                st = getattr(self, "dyn_terms", {}).get(tu.get("uid"))
+                if st is not None:
+                    self.dyn_nets = getattr(self, "dyn_nets", {})
+                    self.dyn_nets[st.get("uid")] = net
+            for el, term, sink in ends:
+                if sink:
+                    if term == "#maxin":
+                        el.set("maxin", net)
+                    elif term == "#selectin":
+                        el.set("selectin", net)
+                    elif term == "#timeoutin":
+                        el.set("timeoutin", net)
+                    elif term == "#cond":
+                        el.set("cond", net)
+                    else:
+                        self._add(el, "inputs", term, net)
+        return None
+
+    def _name_sourceless(self):
+        """Nets whose only source is an end AIXML has no terminal for: named after the first
+        consumer as NI names them, made unique against every net already named (a tunnel's own
+        output net is `<uid>.value` too - Wait Message Loop.vi's tunnel 312 read itself as source)."""
+        self.used_nets = getattr(self, "used_nets", set())
+        for el_ in self.out.iter():
+            for _, n in aixml2vi.pairs(el_.get("outputs")):
+                if n:
+                    self.used_nets.add(n)
+        for sig, ends in getattr(self, "_sourceless", []):
+            base = "%s.value" % ends[0][0].get("uid")
+            net, k = base, 2
+            while net in self.used_nets:
+                net = "%s%d" % (base, k)
+                k += 1
+            self.used_nets.add(net)
+            for el, term, sink in ends:
+                if term == "#selectin":
+                    el.set("selectin", net)
+                elif term == "#timeoutin":
+                    el.set("timeoutin", net)
+                elif term == "#maxin":
+                    el.set("maxin", net)
+                elif term == "#cond":
+                    el.set("cond", net)
+                elif not term.startswith("#"):
+                    self._add(el, "inputs", term, net)
+            for tu in sig.find("termList"):
+                self.term_net[tu.get("uid")] = net
+
+    @staticmethod
+    def _add(el, attr, term, net):
+        cur = el.get(attr)
+        item = "%s:%s" % (escape(term), net)
+        el.set(attr, item if not cur else cur + "," + item)
+
+    def description_text(self):
+        """The VI's description from STRG. pylabview leaves that block BINARY for some VIs - 9 of
+        300 cached NI examples, MGI's among them - as a 4-byte big-endian length and the text
+        (LVblock's STRG parseRSRCSectionData)."""
+        sec = self.b.main.find("STRG/Section")
+        if sec is None:
+            return ""
+        if sec.get("Format") == "bin" and sec.get("File"):
+            data = open(os.path.join(self.b.dir, sec.get("File")), "rb").read()
+            n = int.from_bytes(data[:4], "big") if len(data) >= 4 else 0
+            return lvheap.value_text(data[4:4 + n])
+        # in the station's code page, as LabVIEW wrote it: `Ring repro – Größe` was read back
+        # as written in MacRoman until 2026-11-19 - right only for a VI the composer had
+        # mis-encoded the same way
+        return lvheap.pylv_to_text(string_block_text(sec.find("String")))
+
+    def pane_flags(self):
+        """conIdx (as text) -> connection, read off the pane's Function type.
+
+        0x8000 is a DYNAMIC DISPATCH terminal (Infra/PaneDispatch.cs, checked against NI's own
+        IsStaticMethod) and NI's exporter writes it `dynamic` whatever wire rule sits beside it.
+        This read it as `required` / `recommended` until 2026-10-12, so lvai_vi_terminals on a
+        class accessor answered `Sensor in ... required` where NI's export says `dynamic`, and
+        a method test could not tell the dispatch input among several class-typed ones.
+
+        A .ctl LabVIEW has saved points CONP at its TypeDef, not at a Function, and has no pane:
+        reading that TypeDef's children as terminals failed on 119 of 121 controls (2026-10-14).
+        NI's export then gives the control conIdx 0 `required` when its conNum is the heap's
+        default 0 (3 of 46 controls compared) and nothing when it is -1 (the other 43).
+        """
+        out = {}
+        cons = int(self.b.main.find("CONP/Section/TypeDesc").get("TypeID"))
+        func = self.b.flat[self.b.flat_of_consolidated(cons)]
+        if func.get("Type") != "Function":
+            return {"0": "required"}
+        for i, c in enumerate([c for c in func if c.tag == "TypeDesc"]):
+            f = int(c.get("Flags"), 16)
+            # an assigned slot is one with a TypeID; its flags 0 is OPTIONAL, which NI writes too
+            # (DQMH's Start Module.vi conIdx 6 `optional`, 2026-11-06) - skipped until then
+            if c.get("TypeID") is not None:
+                out[str(i)] = ("dynamic" if f & 0x8000 else "required" if f & 0x1000
+                               else "recommended" if f & 0x0800 else "optional")
+        return out
+
+
+def main(argv):
+    # --labview-root / --addon-locations (issue #99); the resolver of an earlier read in the same
+    # worker may have been built for another LabVIEW
+    global _RESOLVER, FULL_LINK_CHECK
+    import resolve
+    argv = resolve.parse_args(argv)
+    _RESOLVER = None
+    # every linked .ctl and subVI read, whatever its write time (newer_than) - for a tree whose
+    # write times say nothing, a fresh git checkout above all
+    FULL_LINK_CHECK = "--full-link-check" in argv or \
+        os.environ.get("LABVIEWMCP_FULL_LINK_CHECK", "").strip().lower() in ("1", "true", "on", "yes")
+    argv = [a for a in argv if a != "--full-link-check"]
+    LINK_STATS.update(read=set(), skippedByDate=set())
+    src = argv[0]
+    tmp = None
+    if src.lower().endswith(".xml"):
+        main_xml = src
+    else:
+        # a VI INSIDE an .llb container file, its path running through the .llb as LabVIEW writes
+        # it: read from the member resolve.py extracted. vi_path below stays the virtual path, so
+        # the VI's relative links still resolve from where LabVIEW sees it
+        real = src
+        if not os.path.exists(src):
+            import resolve
+            real = resolve.materialize(src)
+            if real is None:
+                split = resolve.llb_split(src)
+                sys.exit("No VI at '%s'%s" % (src, "" if split is None else
+                         ": the .llb container '%s' holds no member '%s'" % split))
+        tmp = tempfile.mkdtemp(prefix="vi2aixml_")
+        main_xml = lvheap.extract(real, tmp)
+    try:
+        reader = Reader(main_xml, vi_path=None if src.lower().endswith(".xml") else os.path.abspath(src))
+        root = reader.read()
+    finally:
+        if tmp:
+            shutil.rmtree(tmp, ignore_errors=True)
+    escape_illegal_xml_chars(root)
+    ET.indent(root, "  ")
+    text = ET.tostring(root, encoding="unicode")
+    pane = getattr(reader, "pane_id", None)
+    if pane is not None:
+        # the connector pane PATTERN, which AIXML has no attribute for: it is part of a subVI's
+        # link binding, so a VI recomposed on the station default broke every caller of NI's
+        # original (`Bad linkage to subVI`, NI's Dual Mode Thermometer facade over C to F.vi,
+        # 4815 recomposed as 4833 - the XControl sweep, 2026-10-22). AFTER </VI>, the one place
+        # NI's service ignores (docs/aixml-frontpanel-extension.md); the composer reads it.
+        text += '\n<?lvmcp pane="%d"?>' % pane
+    for name, (status, detail) in sorted(reader.typedef_findings().items()):
+        # a linked typedef whose embedded copy is stale (drift: the .ctl's definition was used) or
+        # could not be checked against its .ctl (unresolved: the copy was used) - issue #136
+        text += '\n<?lvmcp typedef name="%s" status="%s" detail="%s"?>' % (
+            html.escape(name, quote=True), status, html.escape(detail, quote=True))
+    if LINK_STATS["read"] or LINK_STATS["skippedByDate"]:
+        # how the linked files were checked: a skipped one was written BEFORE this file, so its
+        # copy here is taken as current (newer_than) - `--full-link-check` reads them all
+        text += '\n<?lvmcp linkcheck mode="%s" read="%d" skippedByDate="%d"?>' % (
+            "full" if FULL_LINK_CHECK else "byDate", len(LINK_STATS["read"]), len(LINK_STATS["skippedByDate"]))
+    for uid, (target, status, details) in sorted(reader.subvi_findings.items()):
+        # a subVI call whose callee's connector pane differs from the copy this VI saved (drift:
+        # names, new terminals and types are the callee's) or could not be checked (unresolved)
+        text += '\n<?lvmcp subvi uid="%s" target="%s" status="%s" detail="%s"?>' % (
+            uid, html.escape(target, quote=True), status, html.escape("; ".join(details), quote=True))
+    dyn = [e.get("uid") for e in getattr(reader, "dynamic_fp", []) if e.get("uid")]
+    if dyn:
+        text += '\n<?lvmcp dynamic uids="%s"?>' % ",".join(dyn)
+    for uid, workers in getattr(reader, "parallel_loops", []):
+        # a For Loop's iteration parallelism - NI's export drops it (2026-10-27)
+        text += '\n<?lvmcp parallel uid="%s" workers="%d"?>' % (uid, workers)
+    flags = getattr(reader, "pane_slot_flags", None)
+    if flags:
+        text += '\n<?lvmcp paneflags="%s"?>' % ",".join("%d:%04X" % kv for kv in sorted(flags.items()))
+    # the VI's EXECUTION settings AIXML has no place for - reentrancy above all: a dynamic-dispatch
+    # override must match its parent's, and composed on the skeleton's non-reentrant default 15
+    # Actor Framework members were "one is reentrant, one is not" (the in-place census, 2026-11-07)
+    exe = reader.b.main.find("LVSR/Section/Execution")
+    ins = reader.b.main.find("LVSR/Section/Instrument")
+    if exe is not None:
+        keep = [(k, exe.get(k)) for k in EXEC_KEPT if exe.get(k) is not None]
+        if ins is not None and ins.get("InStBit4") is not None:
+            keep.append(("InStBit4", ins.get("InStBit4")))
+        if keep:
+            text += '\n<?lvmcp exec %s?>' % " ".join('%s="%s"' % kv for kv in keep)
+    for el, names in getattr(reader, "class_refs", []):
+        # the CLASS of each ref{UDClassInst} in that element's type, in the order the type writes
+        # them - AIXML names none, and without it no class-typed terminal could be composed
+        if el.get("uid"):
+            text += '\n<?lvmcp classes uid="%s" names="%s"?>' % (el.get("uid"), html.escape("|".join(names), quote=True))
+    for el in root.iter("Call"):
+        # the FILE a call links to, as its link record holds it (TpVal 0: from <vilib>, <userlib>
+        # ...; 1: relative to the caller) - a bare `target` is a name only, and MGI's Set Combobox
+        # Value.vi calls ITS Compare Two Paths.vi, which the composer otherwise resolved to NI's
+        lp = reader.call_paths.get(el.get("uid") or "")
+        if lp and lp[1]:
+            text += '\n<?lvmcp calllink uid="%s" tp="%d" path="%s"?>' % (
+                el.get("uid"), lp[0], html.escape("|".join(lp[1]), quote=True))
+    if getattr(reader, "xcontrol_fp", None):
+        # which XControl each xControl object is: the front panel's XCXI link names its objects
+        xctl_of = {}
+        for rec in reader.b.main.findall("LIfp/Section/FPHP/XCXI"):
+            qual = ":".join(s.text or "" for s in rec.findall("LinkSaveQualName/String"))
+            for off in rec.findall("LinkOffsetList/Offset"):
+                try:
+                    xctl_of[str(int(off.text, 16))] = qual
+                except (TypeError, ValueError):
+                    pass
+        for el, ddo_uid in reader.xcontrol_fp:
+            if ddo_uid in xctl_of and el.get("uid"):
+                text += '\n<?lvmcp xcontrol uid="%s" xctl="%s"?>' % (el.get("uid"), html.escape(xctl_of[ddo_uid], quote=True))
+    for uid, (lab, bounds) in reader.subpanels().items():
+        # a SUB PANEL, which AIXML has no element for: its label (the implicit nodes' link=)
+        # and where it sits
+        text += '\n<?lvmcp subpanel name="%s" bounds="%s"?>' % (html.escape(lab, quote=True), bounds.strip("()"))
+    for el, cls, strs, rsrc in getattr(reader, "fp_classes", []):
+        # the front-panel object class AIXML has no style for (a listbox is an int32 there),
+        # its annex rsrcID - which says single or MULTICOLUMN listbox - and a listbox's item
+        # strings and column headers as JSON: [sizes, items, headers]
+        if el.get("uid"):
+            text += '\n<?lvmcp fpclass uid="%s" class="%s"%s%s?>' % (
+                el.get("uid"), cls, ' rsrc="%s"' % rsrc if rsrc else "",
+                ' strings="%s"' % html.escape(json.dumps(strs), quote=True)
+                if strs and (strs[1] or strs[2]) else "")
+    for el, st in getattr(reader, "sr_types", []):
+        # a shift register's type, used by the composer only where nothing initializes it
+        if el.get("uid") and not any(n for _, n in aixml2vi.pairs(next(iter(el.findall("Left")), el).get("inputs"))):
+            text += '\n<?lvmcp srtype uid="%s" type="%s"?>' % (el.get("uid"), html.escape(st, quote=True))
+    for uid, net in sorted(getattr(reader, "dyn_nets", {}).items()):
+        # the net wired into an Event Structure's dynamic event terminal, which NI's export leaves
+        # out: with no tunnel carrying the registration the composer has nothing else to go on
+        text += '\n<?lvmcp dynreg uid="%s" net="%s"?>' % (uid, html.escape(net, quote=True))
+    for el, types in getattr(reader, "script_types", []):
+        # a script node's OUTPUT types, which its code does not declare
+        if el.get("uid"):
+            text += '\n<?lvmcp scripttypes uid="%s" types="%s"?>' % (el.get("uid"), html.escape("|".join(types), quote=True))
+    for el, items in getattr(reader, "xctl_refs", []):
+        # the XCONTROL each ref{LV.<Class>} of that element's type is typed to, '' for a plain one
+        if el.get("uid"):
+            text += '\n<?lvmcp xctlrefs uid="%s" items="%s"?>' % (el.get("uid"), html.escape("|".join(items), quote=True))
+    for el, node in getattr(reader, "xnode_nodes", []):
+        # an XNODE's generated code, state and links (Reader.xnode_payload)
+        if el.get("uid"):
+            text += '\n<?lvmcp xnode uid="%s" node="%s"?>' % (
+                el.get("uid"), html.escape(reader.xnode_payload(el, node), quote=True))
+    for el, frame in getattr(reader, "xnode_inlines", []):
+        # the code an XNODE generated, as a one-frame Flat Sequence the composer puts in the Call's
+        # place (Reader.xnode_inline); its tunnels name the Call terminals they stand for (xterm)
+        if el.get("uid"):
+            text += '\n<?lvmcp xnodeinline uid="%s" frame="%s"?>' % (
+                el.get("uid"), html.escape(ET.tostring(frame, encoding="unicode"), quote=True))
+    for el, node, nexf in getattr(reader, "clfn_nodes", []):
+        # a CALL LIBRARY FUNCTION NODE's configuration - library, function, signature, calling
+        # convention, thread - which AIXML has no attribute for (Reader.clfn_payload)
+        if el.get("uid"):
+            text += '\n<?lvmcp clfn uid="%s" node="%s"?>' % (
+                el.get("uid"), html.escape(reader.clfn_payload(el, node, nexf), quote=True))
+    if len(argv) > 1:
+        open(argv[1], "w", encoding="utf-8").write(text + "\n")
+    else:
+        print(text)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

@@ -1,0 +1,6 @@
+tag: v3.1.6
+version: 3.1.6
+commit: d5e7c08b598be2ad646927a9e7620b6f05bb64c8
+built: 2026-11-23T08:43:40Z
+run: https://github.com/Zuehlke/labview-mcp/actions/runs/45140140847
+built-dist: 2026-11-27T07:49:44Z
