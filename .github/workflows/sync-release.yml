@@ -1,0 +1,132 @@
+name: sync-release
+
+# Rebuilds the generated branch (main) from the latest official labview-mcp release:
+# download -> sha256 verify against the release's own checksum asset -> extract ->
+# add the marketplace/ZCode manifests -> force-replace main with a single commit.
+# The tree stays a one-release snapshot; history is intentionally disposable.
+
+on:
+  schedule:
+    - cron: "23 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-release
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch and verify the latest upstream release
+        id: rel
+        run: |
+          set -euo pipefail
+          rel=$(curl -fsSL -H "Accept: application/vnd.github+json" \
+            -H "User-Agent: labview-mcp-zcode-sync" \
+            https://api.github.com/repos/Zuehlke/labview-mcp/releases/latest)
+          tag=$(node -e "console.log(JSON.parse(process.argv[1]).tag_name)" "$rel")
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/rel"
+          for f in labview-mcp.zip labview-mcp.sha256; do
+            curl -fsSL -H "User-Agent: labview-mcp-zcode-sync" -o "$RUNNER_TEMP/rel/$f" \
+              "https://github.com/Zuehlke/labview-mcp/releases/download/${tag}/$f"
+          done
+          cd "$RUNNER_TEMP/rel"
+          sha=$(sha256sum labview-mcp.zip | awk '{print $1}')
+          official=$(awk '{print $1}' labview-mcp.sha256)
+          if [ "$sha" != "$official" ]; then
+            echo "::error::checksum mismatch for $tag (got $sha, official $official)"
+            exit 1
+          fi
+          echo "verified $tag sha256=$sha"
+
+      - name: Already current?
+        id: cmp
+        run: |
+          set -euo pipefail
+          cur=$(awk -F': *' '/^tag:/{print $2}' VERSION.txt 2>/dev/null || true)
+          if [ "$cur" = "${{ steps.rel.outputs.tag }}" ]; then
+            echo "same=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "same=0" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Rebuild the branch
+        if: steps.cmp.outputs.same == '0'
+        env:
+          TAG: ${{ steps.rel.outputs.tag }}
+        run: |
+          set -euo pipefail
+          tree="$RUNNER_TEMP/tree"
+          mkdir -p "$tree"
+          unzip -q "$RUNNER_TEMP/rel/labview-mcp.zip" -d "$tree"
+
+          # Generated manifests: listing (both discovery locations) + ZCode manifest.
+          node -e '
+            const fs = require("fs");
+            const d = process.env.RUNNER_TEMP + "/tree";
+            const pj = JSON.parse(fs.readFileSync(d + "/.claude-plugin/plugin.json", "utf8"));
+            const mcp = JSON.parse(fs.readFileSync(d + "/.mcp.json", "utf8"));
+            const vt = fs.readFileSync(d + "/VERSION.txt", "utf8");
+            const tag = vt.match(/^tag:\s*(\S+)/m)[1];
+            const version = tag.replace(/^v/, "");
+            if (pj.version !== version) throw new Error(`version mismatch: ${pj.version} vs ${version}`);
+            const zc = {
+              name: pj.name, displayName: pj.displayName || "LabVIEW MCP", version,
+              description: pj.description, author: pj.author, homepage: pj.homepage,
+              mcpServers: mcp.mcpServers,
+            };
+            fs.mkdirSync(d + "/.zcode-plugin", { recursive: true });
+            fs.writeFileSync(d + "/.zcode-plugin/plugin.json", JSON.stringify(zc, null, 2) + "\n");
+            const listing = {
+              name: "zuehlke-labview-zcode",
+              description: "Community ZCode marketplace for the official LabVIEW MCP release. Unofficial - not affiliated with or endorsed by Zuhlke. The tree is the official release, sha256-verified.",
+              owner: { name: "SeveNOlogy7" },
+              plugins: [{
+                name: "labview-mcp",
+                source: "./",
+                version,
+                description: pj.description,
+                author: { name: "Zuhlke Engineering AG (upstream); marketplace maintained by SeveNOlogy7" },
+                homepage: pj.homepage,
+                repository: "https://github.com/Zuehlke/labview-mcp",
+                license: "MIT",
+                keywords: ["labview", "mcp", "aixml", "ni", "zcode"],
+                category: "developer-tools",
+              }],
+            };
+            const text = JSON.stringify(listing, null, 2) + "\n";
+            fs.writeFileSync(d + "/marketplace.json", text);
+            fs.writeFileSync(d + "/.claude-plugin/marketplace.json", text);
+          '
+
+          # Static files that must survive the rewrite.
+          cp README.md "$tree/"
+          mkdir -p "$tree/.github/workflows"
+          cp .github/workflows/sync-release.yml "$tree/.github/workflows/"
+          : > "$tree/.gitignore"
+
+          git checkout --orphan sync-tree
+          git rm -rf . >/dev/null 2>&1 || true
+          cp -a "$tree/." .
+          git add -A --force
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "release: ${TAG} (official release tree, sha256-verified; built-dist visible in VERSION.txt of the release)"
+
+          # Assertions: the tree must carry the exe and every manifest.
+          row=$(git ls-tree -r --long HEAD | awk '$NF=="bin/LabVIEWMCP.exe"{print $(NF-1)}')
+          test -n "$row" || { echo "::error::bin/LabVIEWMCP.exe missing from the commit"; exit 1; }
+          test "$row" = "$(stat -c %s bin/LabVIEWMCP.exe)" || { echo "::error::exe size mismatch"; exit 1; }
+          for f in marketplace.json .claude-plugin/marketplace.json .claude-plugin/plugin.json .zcode-plugin/plugin.json .mcp.json VERSION.txt; do
+            git ls-tree -r HEAD | grep -q "	$f$" || { echo "::error::missing $f"; exit 1; }
+          done
+
+          git push --force origin HEAD:main
+          echo "main rebuilt at $(git rev-parse --short HEAD) for ${TAG}"
